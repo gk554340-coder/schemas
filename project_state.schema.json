@@ -1,0 +1,664 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autonomous-cinema-studio.local/schemas/project_state.schema.json",
+  "title": "Project State",
+  "description": "Persistent, versioned project state for checkpoint recovery, stage tracking, error reporting, and crash-safe execution in the Autonomous AI Cinema and Documentary Studio Engine.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "job_id",
+    "project_id",
+    "status",
+    "revision",
+    "current_stage",
+    "stages",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "job_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "project_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "project_title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 300
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "created",
+        "queued",
+        "running",
+        "paused",
+        "recovering",
+        "completed",
+        "failed",
+        "cancelled",
+        "needs_review"
+      ]
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "current_stage": {
+      "type": "string",
+      "enum": [
+        "initialization",
+        "slot1_research",
+        "slot2_screenplay",
+        "slot4_audio",
+        "slot3_visuals",
+        "slot5_editor",
+        "final_validation",
+        "completed",
+        "none"
+      ]
+    },
+    "stages": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/stageState"
+      }
+    },
+    "checkpoint": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/checkpoint"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/errorObject"
+      }
+    },
+    "recovery_attempts": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "max_recovery_attempts": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "last_recovery_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "last_error_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^ERR_[A-Za-z0-9_-]+$"
+    },
+    "cancel_requested": {
+      "type": "boolean"
+    },
+    "pause_requested": {
+      "type": "boolean"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "started_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "completed_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "metadata": {
+      "$ref": "#/$defs/projectMetadata"
+    }
+  },
+  "$defs": {
+    "stageState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stage_id",
+        "stage_name",
+        "status",
+        "attempt",
+        "checkpoint_hash",
+        "started_at",
+        "completed_at",
+        "updated_at"
+      ],
+      "properties": {
+        "stage_id": {
+          "type": "string",
+          "enum": [
+            "initialization",
+            "slot1_research",
+            "slot2_screenplay",
+            "slot4_audio",
+            "slot3_visuals",
+            "slot5_editor",
+            "final_validation"
+          ]
+        },
+        "stage_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "queued",
+            "running",
+            "paused",
+            "completed",
+            "failed",
+            "skipped",
+            "retrying",
+            "cancelled",
+            "needs_review"
+          ]
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_attempts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "checkpoint_hash": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "checkpoint_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 2000
+        },
+        "input_hash": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "output_hash": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "input_artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/artifactReference"
+          }
+        },
+        "output_artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/artifactReference"
+          }
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "completed_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "duration_seconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "worker_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 200
+        },
+        "error_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^ERR_[A-Za-z0-9_-]+$"
+          }
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          }
+        }
+      }
+    },
+    "checkpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "checkpoint_id",
+        "stage_id",
+        "revision",
+        "created_at",
+        "checkpoint_hash",
+        "artifacts"
+      ],
+      "properties": {
+        "checkpoint_id": {
+          "type": "string",
+          "pattern": "^CHK_[A-Za-z0-9_-]+$"
+        },
+        "stage_id": {
+          "type": "string",
+          "enum": [
+            "initialization",
+            "slot1_research",
+            "slot2_screenplay",
+            "slot4_audio",
+            "slot3_visuals",
+            "slot5_editor",
+            "final_validation"
+          ]
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "checkpoint_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 2000
+        },
+        "checkpoint_hash": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "previous_checkpoint_hash": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/artifactReference"
+          }
+        },
+        "state_snapshot_hash": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "integrity_verified": {
+          "type": "boolean"
+        },
+        "recovery_compatible": {
+          "type": "boolean"
+        }
+      }
+    },
+    "artifactReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "artifact_type",
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "artifact_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "artifact_type": {
+          "type": "string",
+          "enum": [
+            "research_output",
+            "screenplay_blueprint",
+            "audio_timeline",
+            "visual_asset",
+            "video_segment",
+            "final_video",
+            "subtitle_file",
+            "thumbnail",
+            "metadata",
+            "log",
+            "other"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "size_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "media_type": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 200
+        },
+        "created_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      }
+    },
+    "errorObject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "error_id",
+        "timestamp",
+        "stage_id",
+        "error_type",
+        "message",
+        "severity",
+        "recoverable"
+      ],
+      "properties": {
+        "error_id": {
+          "type": "string",
+          "pattern": "^ERR_[A-Za-z0-9_-]+$"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "stage_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "initialization",
+            "slot1_research",
+            "slot2_screenplay",
+            "slot4_audio",
+            "slot3_visuals",
+            "slot5_editor",
+            "final_validation",
+            null
+          ]
+        },
+        "error_type": {
+          "type": "string",
+          "enum": [
+            "validation_error",
+            "configuration_error",
+            "dependency_error",
+            "network_error",
+            "provider_error",
+            "resource_exhaustion",
+            "timeout",
+            "process_crash",
+            "checkpoint_corruption",
+            "artifact_integrity_error",
+            "permission_error",
+            "cancelled",
+            "unexpected_error",
+            "other"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8000
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "info",
+            "warning",
+            "error",
+            "critical"
+          ]
+        },
+        "recoverable": {
+          "type": "boolean"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "retry_attempt": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "exception_class": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 500
+        },
+        "stack_trace": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 30000
+        },
+        "component": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 300
+        },
+        "process_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "recovery_action": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "retry_stage",
+            "restore_checkpoint",
+            "restart_worker",
+            "skip_stage",
+            "abort_job",
+            "manual_intervention",
+            "none",
+            null
+          ]
+        },
+        "context": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "type": "string",
+              "maxLength": 500
+            },
+            "artifact_path": {
+              "type": "string",
+              "maxLength": 2000
+            },
+            "checkpoint_id": {
+              "type": "string",
+              "pattern": "^CHK_[A-Za-z0-9_-]+$"
+            },
+            "dependency": {
+              "type": "string",
+              "maxLength": 500
+            },
+            "details": {
+              "type": "string",
+              "maxLength": 8000
+            }
+          }
+        },
+        "resolved": {
+          "type": "boolean"
+        },
+        "resolved_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      }
+    },
+    "projectMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requested_format": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "target_duration_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 7200
+        },
+        "language": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 35
+        },
+        "test_mode": {
+          "type": "boolean"
+        },
+        "configuration_hash": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "engine_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "schema_versions": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "research_output": {
+              "type": "string",
+              "maxLength": 50
+            },
+            "screenplay_blueprint": {
+              "type": "string",
+              "maxLength": 50
+            },
+            "audio_timeline": {
+              "type": "string",
+              "maxLength": 50
+            },
+            "project_state": {
+              "type": "string",
+              "maxLength": 50
+            }
+          }
+        },
+        "tags": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          }
+        }
+      }
+    }
+  }
+}
