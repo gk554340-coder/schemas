@@ -1,0 +1,622 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autonomous-cinema-studio.local/schemas/screenplay_blueprint.schema.json",
+  "title": "Screenplay Blueprint",
+  "description": "Validated screenplay and scene blueprint produced by Slot 2 for the Autonomous AI Cinema and Documentary Studio Engine.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "job_id",
+    "project_title",
+    "language",
+    "target_duration_seconds",
+    "format",
+    "genre",
+    "narrative_style",
+    "research_reference",
+    "scenes",
+    "total_estimated_duration_seconds",
+    "continuity_notes",
+    "screenplay_status"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "job_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "project_title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 300
+    },
+    "language": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 35
+    },
+    "target_duration_seconds": {
+      "type": "integer",
+      "minimum": 60,
+      "maximum": 7200
+    },
+    "format": {
+      "type": "string",
+      "enum": [
+        "documentary",
+        "short_documentary",
+        "reel",
+        "short_film",
+        "educational",
+        "historical_narrative",
+        "biographical",
+        "explainer"
+      ]
+    },
+    "genre": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "narrative_style": {
+      "type": "string",
+      "enum": [
+        "investigative",
+        "cinematic",
+        "educational",
+        "journalistic",
+        "dramatic",
+        "conversational",
+        "poetic",
+        "neutral"
+      ]
+    },
+    "research_reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "research_schema_version",
+        "research_status",
+        "source_ids",
+        "fact_ids"
+      ],
+      "properties": {
+        "research_schema_version": {
+          "type": "string",
+          "const": "1.0.0"
+        },
+        "research_status": {
+          "type": "string",
+          "enum": [
+            "complete",
+            "partial",
+            "insufficient_evidence"
+          ]
+        },
+        "source_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^SRC_[A-Za-z0-9_-]+$"
+          }
+        },
+        "fact_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^FACT_[A-Za-z0-9_-]+$"
+          }
+        }
+      }
+    },
+    "scenes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/scene"
+      }
+    },
+    "total_estimated_duration_seconds": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "continuity_notes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 2000
+      }
+    },
+    "screenplay_status": {
+      "type": "string",
+      "enum": [
+        "complete",
+        "partial",
+        "needs_review",
+        "failed"
+      ]
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "message",
+          "severity"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_]*$"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "info",
+              "warning",
+              "error"
+            ]
+          },
+          "scene_id": {
+            "type": "string",
+            "pattern": "^SCN_[A-Za-z0-9_-]+$"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "scene": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scene_id",
+        "scene_number",
+        "title",
+        "purpose",
+        "duration_seconds",
+        "narration",
+        "dialogue",
+        "visual_description",
+        "camera_shot",
+        "visual_prompt",
+        "music_intensity",
+        "sfx_tags",
+        "transition",
+        "research_fact_ids",
+        "continuity_requirements"
+      ],
+      "properties": {
+        "scene_id": {
+          "type": "string",
+          "pattern": "^SCN_[A-Za-z0-9_-]+$"
+        },
+        "scene_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "purpose": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "duration_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1800
+        },
+        "narration": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/narrationSegment"
+          }
+        },
+        "dialogue": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/dialogueLine"
+          }
+        },
+        "visual_description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 5000
+        },
+        "camera_shot": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "shot_type",
+            "camera_movement",
+            "framing",
+            "angle"
+          ],
+          "properties": {
+            "shot_type": {
+              "type": "string",
+              "enum": [
+                "establishing",
+                "extreme_wide",
+                "wide",
+                "medium",
+                "medium_close_up",
+                "close_up",
+                "extreme_close_up",
+                "over_the_shoulder",
+                "point_of_view",
+                "aerial",
+                "macro",
+                "cutaway",
+                "insert",
+                "montage",
+                "screen_capture",
+                "archival",
+                "custom"
+              ]
+            },
+            "camera_movement": {
+              "type": "string",
+              "enum": [
+                "static",
+                "pan_left",
+                "pan_right",
+                "tilt_up",
+                "tilt_down",
+                "dolly_in",
+                "dolly_out",
+                "truck_left",
+                "truck_right",
+                "tracking",
+                "orbit",
+                "crane_up",
+                "crane_down",
+                "handheld",
+                "steadicam",
+                "zoom_in",
+                "zoom_out",
+                "drone_flyover",
+                "custom"
+              ]
+            },
+            "framing": {
+              "type": "string",
+              "enum": [
+                "centered",
+                "rule_of_thirds",
+                "symmetrical",
+                "leading_lines",
+                "negative_space",
+                "layered_depth",
+                "custom"
+              ]
+            },
+            "angle": {
+              "type": "string",
+              "enum": [
+                "eye_level",
+                "high_angle",
+                "low_angle",
+                "birds_eye",
+                "worms_eye",
+                "dutch_angle",
+                "overhead",
+                "ground_level",
+                "custom"
+              ]
+            },
+            "lens_description": {
+              "type": "string",
+              "maxLength": 500
+            },
+            "shot_notes": {
+              "type": "string",
+              "maxLength": 2000
+            }
+          }
+        },
+        "visual_prompt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 10000
+        },
+        "negative_visual_prompt": {
+          "type": "string",
+          "maxLength": 5000
+        },
+        "music_intensity": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "music_mood": {
+          "type": "string",
+          "enum": [
+            "none",
+            "neutral",
+            "calm",
+            "hopeful",
+            "inspiring",
+            "tense",
+            "suspenseful",
+            "sad",
+            "melancholic",
+            "triumphant",
+            "mysterious",
+            "epic",
+            "reflective",
+            "urgent",
+            "custom"
+          ]
+        },
+        "sfx_tags": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9][a-zA-Z0-9 _-]{0,79}$"
+          }
+        },
+        "ambience_tags": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9][a-zA-Z0-9 _-]{0,79}$"
+          }
+        },
+        "transition": {
+          "type": "string",
+          "enum": [
+            "cut",
+            "fade_in",
+            "fade_out",
+            "cross_dissolve",
+            "match_cut",
+            "whip_pan",
+            "dip_to_black",
+            "dip_to_white",
+            "audio_bridge",
+            "montage_transition",
+            "custom"
+          ]
+        },
+        "transition_notes": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "research_fact_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^FACT_[A-Za-z0-9_-]+$"
+          }
+        },
+        "continuity_requirements": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          }
+        },
+        "on_screen_text": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/onScreenText"
+          }
+        },
+        "visual_assets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/visualAsset"
+          }
+        },
+        "scene_status": {
+          "type": "string",
+          "enum": [
+            "draft",
+            "approved",
+            "needs_review",
+            "blocked"
+          ]
+        }
+      }
+    },
+    "narrationSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "segment_id",
+        "text",
+        "estimated_duration_seconds",
+        "delivery_style"
+      ],
+      "properties": {
+        "segment_id": {
+          "type": "string",
+          "pattern": "^NAR_[A-Za-z0-9_-]+$"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 10000
+        },
+        "estimated_duration_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 600
+        },
+        "delivery_style": {
+          "type": "string",
+          "enum": [
+            "neutral",
+            "conversational",
+            "documentary",
+            "dramatic",
+            "whispered",
+            "urgent",
+            "reflective",
+            "emotional",
+            "authoritative",
+            "custom"
+          ]
+        },
+        "emphasis_words": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          }
+        },
+        "pause_after_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        }
+      }
+    },
+    "dialogueLine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "speaker",
+        "text"
+      ],
+      "properties": {
+        "speaker": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 5000
+        },
+        "delivery_style": {
+          "type": "string",
+          "enum": [
+            "neutral",
+            "calm",
+            "excited",
+            "angry",
+            "sad",
+            "whispered",
+            "urgent",
+            "formal",
+            "casual",
+            "custom"
+          ]
+        },
+        "estimated_duration_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 300
+        }
+      }
+    },
+    "onScreenText": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "text",
+        "display_type"
+      ],
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "display_type": {
+          "type": "string",
+          "enum": [
+            "title",
+            "subtitle",
+            "lower_third",
+            "caption",
+            "date",
+            "location",
+            "statistic",
+            "quotation",
+            "source_credit",
+            "custom"
+          ]
+        },
+        "start_offset_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "duration_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "visualAsset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "asset_id",
+        "asset_type",
+        "description"
+      ],
+      "properties": {
+        "asset_id": {
+          "type": "string",
+          "pattern": "^AST_[A-Za-z0-9_-]+$"
+        },
+        "asset_type": {
+          "type": "string",
+          "enum": [
+            "generated_image",
+            "generated_video",
+            "archival_image",
+            "archival_video",
+            "map",
+            "chart",
+            "diagram",
+            "photograph",
+            "screen_capture",
+            "other"
+          ]
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "source_id": {
+          "type": "string",
+          "pattern": "^SRC_[A-Za-z0-9_-]+$"
+        },
+        "license_notes": {
+          "type": "string",
+          "maxLength": 2000
+        }
+      }
+    }
+  }
+}
