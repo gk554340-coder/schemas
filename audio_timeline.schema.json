@@ -1,0 +1,797 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autonomous-cinema-studio.local/schemas/audio_timeline.schema.json",
+  "title": "Audio Timeline",
+  "description": "Validated audio production timeline produced by Slot 4 for the Autonomous AI Cinema and Documentary Studio Engine.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "job_id",
+    "project_id",
+    "language",
+    "sample_rate_hz",
+    "channels",
+    "total_duration_seconds",
+    "narration_assets",
+    "audio_segments",
+    "volume_envelopes",
+    "silence_intervals",
+    "scene_anchors",
+    "audio_status"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "job_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "project_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "language": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 35
+    },
+    "sample_rate_hz": {
+      "type": "integer",
+      "enum": [
+        22050,
+        24000,
+        32000,
+        44100,
+        48000,
+        96000
+      ]
+    },
+    "channels": {
+      "type": "integer",
+      "enum": [
+        1,
+        2
+      ]
+    },
+    "total_duration_seconds": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 7200
+    },
+    "audio_format": {
+      "type": "string",
+      "enum": [
+        "wav",
+        "flac",
+        "mp3",
+        "ogg",
+        "aac",
+        "pcm"
+      ]
+    },
+    "master_audio_path": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 2000
+    },
+    "narration_assets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/narrationAsset"
+      }
+    },
+    "audio_segments": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/audioSegment"
+      }
+    },
+    "volume_envelopes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/volumeEnvelope"
+      }
+    },
+    "silence_intervals": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/silenceInterval"
+      }
+    },
+    "scene_anchors": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/sceneAnchor"
+      }
+    },
+    "mixing_settings": {
+      "$ref": "#/$defs/mixingSettings"
+    },
+    "loudness_report": {
+      "$ref": "#/$defs/loudnessReport"
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/warning"
+      }
+    },
+    "audio_status": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "generating",
+        "partial",
+        "complete",
+        "needs_review",
+        "failed"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "$defs": {
+    "narrationAsset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "asset_id",
+        "scene_id",
+        "segment_id",
+        "text",
+        "audio_path",
+        "start_seconds",
+        "end_seconds",
+        "duration_seconds",
+        "voice_profile",
+        "word_timestamps",
+        "generation_status"
+      ],
+      "properties": {
+        "asset_id": {
+          "type": "string",
+          "pattern": "^NAR_AUD_[A-Za-z0-9_-]+$"
+        },
+        "scene_id": {
+          "type": "string",
+          "pattern": "^SCN_[A-Za-z0-9_-]+$"
+        },
+        "segment_id": {
+          "type": "string",
+          "pattern": "^NAR_[A-Za-z0-9_-]+$"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20000
+        },
+        "audio_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 2000
+        },
+        "audio_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "start_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "end_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "duration_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "voice_profile": {
+          "$ref": "#/$defs/voiceProfile"
+        },
+        "word_timestamps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/wordTimestamp"
+          }
+        },
+        "generation_status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "generating",
+            "complete",
+            "partial",
+            "failed"
+          ]
+        },
+        "pronunciation_notes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          }
+        },
+        "generation_error": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4000
+        }
+      }
+    },
+    "voiceProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "voice_id",
+        "language",
+        "speaking_rate",
+        "pitch"
+      ],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "voice_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "language": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 35
+        },
+        "gender_presentation": {
+          "type": "string",
+          "enum": [
+            "feminine",
+            "masculine",
+            "androgynous",
+            "neutral",
+            "unspecified"
+          ]
+        },
+        "speaking_rate": {
+          "type": "number",
+          "minimum": 0.5,
+          "maximum": 2.0
+        },
+        "pitch": {
+          "type": "number",
+          "minimum": -20,
+          "maximum": 20
+        },
+        "style": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "emotion": {
+          "type": "string",
+          "enum": [
+            "neutral",
+            "calm",
+            "curious",
+            "serious",
+            "dramatic",
+            "sad",
+            "hopeful",
+            "excited",
+            "urgent",
+            "reassuring",
+            "custom"
+          ]
+        }
+      }
+    },
+    "wordTimestamp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "word_index",
+        "word",
+        "start_seconds",
+        "end_seconds"
+      ],
+      "properties": {
+        "word_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "word": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "start_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "end_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "phoneme_timestamps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/phonemeTimestamp"
+          }
+        }
+      }
+    },
+    "phonemeTimestamp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phoneme",
+        "start_seconds",
+        "end_seconds"
+      ],
+      "properties": {
+        "phoneme": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 30
+        },
+        "start_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "end_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "audioSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "segment_id",
+        "segment_type",
+        "start_seconds",
+        "end_seconds",
+        "duration_seconds",
+        "audio_path",
+        "volume",
+        "fade_in_seconds",
+        "fade_out_seconds"
+      ],
+      "properties": {
+        "segment_id": {
+          "type": "string",
+          "pattern": "^AUD_[A-Za-z0-9_-]+$"
+        },
+        "segment_type": {
+          "type": "string",
+          "enum": [
+            "narration",
+            "dialogue",
+            "background_music",
+            "sound_effect",
+            "ambience",
+            "room_tone",
+            "silence",
+            "transition",
+            "other"
+          ]
+        },
+        "scene_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^SCN_[A-Za-z0-9_-]+$"
+        },
+        "asset_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "start_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "end_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "duration_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "audio_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 2000
+        },
+        "volume": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "pan": {
+          "type": "number",
+          "minimum": -1,
+          "maximum": 1
+        },
+        "fade_in_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "fade_out_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "ducking_group": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 100
+        },
+        "loop": {
+          "type": "boolean"
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "description": {
+              "type": "string",
+              "maxLength": 2000
+            },
+            "source": {
+              "type": "string",
+              "maxLength": 1000
+            },
+            "license": {
+              "type": "string",
+              "maxLength": 1000
+            },
+            "tags": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100
+              }
+            }
+          }
+        }
+      }
+    },
+    "volumeEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "envelope_id",
+        "target_segment_id",
+        "points",
+        "interpolation"
+      ],
+      "properties": {
+        "envelope_id": {
+          "type": "string",
+          "pattern": "^ENV_[A-Za-z0-9_-]+$"
+        },
+        "target_segment_id": {
+          "type": "string",
+          "pattern": "^AUD_[A-Za-z0-9_-]+$"
+        },
+        "points": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "$ref": "#/$defs/volumePoint"
+          }
+        },
+        "interpolation": {
+          "type": "string",
+          "enum": [
+            "linear",
+            "smooth",
+            "step",
+            "cubic"
+          ]
+        },
+        "purpose": {
+          "type": "string",
+          "enum": [
+            "fade",
+            "ducking",
+            "emphasis",
+            "normalization",
+            "manual_mix",
+            "other"
+          ]
+        }
+      }
+    },
+    "volumePoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "time_seconds",
+        "gain"
+      ],
+      "properties": {
+        "time_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "gain": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 2
+        }
+      }
+    },
+    "silenceInterval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "silence_id",
+        "start_seconds",
+        "end_seconds",
+        "duration_seconds",
+        "silence_type"
+      ],
+      "properties": {
+        "silence_id": {
+          "type": "string",
+          "pattern": "^SIL_[A-Za-z0-9_-]+$"
+        },
+        "start_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "end_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "duration_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "silence_type": {
+          "type": "string",
+          "enum": [
+            "absolute_silence",
+            "narrative_pause",
+            "dramatic_pause",
+            "breath_pause",
+            "transition_gap",
+            "intentional_room_tone",
+            "other"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "preserve_ambience": {
+          "type": "boolean"
+        }
+      }
+    },
+    "sceneAnchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scene_id",
+        "start_seconds",
+        "end_seconds",
+        "anchor_type"
+      ],
+      "properties": {
+        "scene_id": {
+          "type": "string",
+          "pattern": "^SCN_[A-Za-z0-9_-]+$"
+        },
+        "start_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "end_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "anchor_type": {
+          "type": "string",
+          "enum": [
+            "scene_start",
+            "scene_end",
+            "narration_start",
+            "narration_end",
+            "music_cue",
+            "sound_effect_cue",
+            "transition_point",
+            "visual_sync_point",
+            "other"
+          ]
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "related_segment_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^AUD_[A-Za-z0-9_-]+$"
+          }
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 2000
+        }
+      }
+    },
+    "mixingSettings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_loudness_lufs",
+        "true_peak_limit_dbtp",
+        "normalize_output",
+        "stereo_mode"
+      ],
+      "properties": {
+        "target_loudness_lufs": {
+          "type": "number",
+          "minimum": -30,
+          "maximum": -5
+        },
+        "true_peak_limit_dbtp": {
+          "type": "number",
+          "minimum": -9,
+          "maximum": 0
+        },
+        "normalize_output": {
+          "type": "boolean"
+        },
+        "stereo_mode": {
+          "type": "string",
+          "enum": [
+            "mono",
+            "stereo",
+            "preserve_source"
+          ]
+        },
+        "limiter_enabled": {
+          "type": "boolean"
+        },
+        "compressor_enabled": {
+          "type": "boolean"
+        },
+        "noise_reduction_enabled": {
+          "type": "boolean"
+        },
+        "crossfade_enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "loudnessReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "integrated_loudness_lufs",
+        "true_peak_dbtp",
+        "measured_duration_seconds",
+        "measurement_status"
+      ],
+      "properties": {
+        "integrated_loudness_lufs": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": -100,
+          "maximum": 20
+        },
+        "true_peak_dbtp": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": -100,
+          "maximum": 20
+        },
+        "measured_duration_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "measurement_status": {
+          "type": "string",
+          "enum": [
+            "not_measured",
+            "passed",
+            "warning",
+            "failed"
+          ]
+        },
+        "measurement_notes": {
+          "type": "string",
+          "maxLength": 4000
+        }
+      }
+    },
+    "warning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "severity"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]*$"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "info",
+            "warning",
+            "error"
+          ]
+        },
+        "related_asset_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "related_scene_id": {
+          "type": "string",
+          "pattern": "^SCN_[A-Za-z0-9_-]+$"
+        }
+      }
+    }
+  }
+}
