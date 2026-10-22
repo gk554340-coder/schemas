@@ -1,17 +1,18 @@
 
-from __future__ import annotations
+from future import annotations
 
-import concurrent.futures
+import argparse
 import hashlib
-import importlib
-import inspect
 import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
+import sys
 import threading
 import time
+import traceback
 import uuid
 
 from contextlib import contextmanager
@@ -19,1335 +20,1933 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-ROOT_DIR = Path(__file__).resolve().parent
-WORKSPACE_DIR = Path(
-    os.getenv("CINEMA_WORKSPACE_DIR", str(ROOT_DIR / "workspace"))
-).expanduser().resolve()
-
+ROOT_DIR = Path(file).resolve().parent
+WORKSPACE_DIR = ROOT_DIR / "workspace"
+STATE_DIR = WORKSPACE_DIR / "05_master_theater" / "state"
 DEFAULT_OUTPUT_ROOT = WORKSPACE_DIR / "05_master_theater"
 STATE_FILENAME = "project_state.json"
-STATE_VERSION = "2.0.0"
+STATE_VERSION = "1.0.0"
 
-PROFILES = {
-    "reel": {
-        "duration_seconds": 15,
-        "aspect_ratio": "9:16",
-        "width": 720,
-        "height": 1280,
-        "screenplay_profile": "short_form",
-    },
-    "documentary": {
-        "duration_seconds": 60,
-        "aspect_ratio": "16:9",
-        "width": 1280,
-        "height": 720,
-        "screenplay_profile": "long",
-    },
-}
-
-DEFAULT_STAGE_ORDER = [
-    "slot1_research",
-    "slot2_screenplay",
-    "slot4_audio",
-    "slot3_visuals",
-    "slot5_editor",
-]
+STAGE_ORDER = (
+"slot1_research",
+"slot2_screenplay",
+"slot4_audio",
+"slot3_visuals",
+"slot5_editor",
+)
 
 STAGE_TIMEOUT_SECONDS = {
-    "slot1_research": 300,
-    "slot2_screenplay": 300,
-    "slot4_audio": 600,
-    "slot3_visuals": 900,
-    "slot5_editor": 600,
+"slot1_research": 300,
+"slot2_screenplay": 300,
+"slot4_audio": 600,
+"slot3_visuals": 900,
+"slot5_editor": 600,
 }
 
-STAGE_DIRECTORIES = {
-    "slot1_research": "01_research_vault",
-    "slot2_screenplay": "02_screenplay_desk",
-    "slot4_audio": "03_audio_studio",
-    "slot3_visuals": "04_visual_lab",
-    "slot5_editor": "05_master_theater",
+PROFILE_DEFAULTS = {
+"reel": {
+"duration_seconds": 15,
+"aspect_ratio": "9:16",
+"resolution": "720x1280",
+"description": "Short-form vertical cinematic video",
+},
+"documentary": {
+"duration_seconds": 60,
+"aspect_ratio": "16:9",
+"resolution": "1280x720",
+"description": "Narrative documentary video",
+},
 }
 
-STAGE_MODULES = {
-    "slot1_research": ("slot1_research", "run_research"),
-    "slot2_screenplay": ("slot2_screenplay", "run_screenplay"),
-    "slot4_audio": ("slot4_audio", "run_audio"),
-    "slot3_visuals": ("slot3_visuals", "run_visuals"),
-    "slot5_editor": ("slot5_editor", "run_editor"),
-}
-
-TERMINAL_STATES = {"completed", "failed", "cancelled"}
-VALID_STATES = {
-    "created", "queued", "running", "cancelling",
-    "completed", "failed", "cancelled",
-}
-
-logger = logging.getLogger("cinema_pipeline")
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
+LOGGER = logging.getLogger("cinema.master_pipeline")
 
 _ACTIVE_JOBS: dict[str, dict[str, Any]] = {}
 _ACTIVE_JOBS_LOCK = threading.RLock()
 _CANCEL_EVENTS: dict[str, threading.Event] = {}
-_CANCEL_LOCK = threading.RLock()
-_PROJECT_LOCKS: dict[str, threading.RLock] = {}
-_PROJECT_LOCKS_LOCK = threading.RLock()
-
-
-# ---------------------------------------------------------------------------
-# Exceptions and utilities
-# ---------------------------------------------------------------------------
+_CANCEL_EVENTS_LOCK = threading.RLock()
 
 class PipelineError(RuntimeError):
-    """Base pipeline exception."""
-
+"""Raised when a pipeline stage or project operation fails."""
 
 class PipelineCancelled(PipelineError):
-    """Raised when cooperative cancellation is requested."""
-
+"""Raised when a pipeline is cancelled by the caller."""
 
 class StateIntegrityError(PipelineError):
-    """Raised when project state is invalid or corrupted."""
-
+"""Raised when project state or a stage artifact fails integrity checks."""
 
 class StageExecutionError(PipelineError):
-    """Raised when a production stage fails."""
-
+"""Raised when a stage cannot complete successfully."""
 
 def utc_now() -> str:
-    """Return a timezone-aware UTC timestamp."""
-    return datetime.now(timezone.utc).isoformat()
+"""Return a timezone-aware UTC timestamp."""
+return datetime.now(timezone.utc).isoformat()
 
+def _json_safe(value: Any) -> Any:
+"""Convert supported objects into JSON-compatible values."""
+if hasattr(value, "model_dump") and callable(value.model_dump):
+return value.model_dump(mode="json")
 
-def json_safe(value: Any) -> Any:
-    """Convert values into JSON-compatible data."""
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, dict):
-        return {str(k): json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [json_safe(v) for v in value]
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    return str(value)
+if hasattr(value, "dict") and callable(value.dict):  
+    return value.dict()  
 
+if isinstance(value, Path):  
+    return str(value)  
 
-def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
-    """Write JSON atomically to avoid partially written state files."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8") as handle:
-            json.dump(
-                json_safe(data),
-                handle,
-                ensure_ascii=False,
-                indent=2,
-            )
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+if isinstance(value, dict):  
+    return {str(key): _json_safe(item) for key, item in value.items()}  
 
+if isinstance(value, (list, tuple)):  
+    return [_json_safe(item) for item in value]  
 
-def read_json(path: Path) -> dict[str, Any]:
-    """Read a JSON object from disk."""
-    with path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
-    if not isinstance(data, dict):
-        raise StateIntegrityError(f"Expected a JSON object: {path}")
-    return data
+if isinstance(value, (str, int, float, bool)) or value is None:  
+    return value  
 
+return str(value)
 
-def sha256_file(path: Path) -> str:
-    """Calculate a file's SHA-256 checksum."""
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _read_json(path: Path) -> dict[str, Any]:
+"""Read a JSON object from disk."""
+try:
+with path.open("r", encoding="utf-8") as file:
+data = json.load(file)
+except (OSError, json.JSONDecodeError) as exc:
+raise PipelineError(f"Unable to read JSON file {path}: {exc}") from exc
 
+if not isinstance(data, dict):  
+    raise PipelineError(f"Expected a JSON object in {path}")  
 
-def resolve_path(value: str | Path) -> Path:
-    """Resolve a filesystem path."""
-    return Path(value).expanduser().resolve()
+return data
 
+def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+"""Write JSON atomically using a temporary file in the destination directory."""
+path.parent.mkdir(parents=True, exist_ok=True)
+temporary_path = path.with_name(
+f".{path.name}.{uuid.uuid4().hex}.tmp"
+)
 
-def is_within(path: Path, root: Path) -> bool:
-    """Return whether a resolved path is contained in a trusted directory."""
-    try:
-        path.resolve().relative_to(root.resolve())
-        return True
-    except (OSError, ValueError):
-        return False
+try:  
+    with temporary_path.open("w", encoding="utf-8", newline="\n") as file:  
+        json.dump(  
+            _json_safe(data),  
+            file,  
+            ensure_ascii=False,  
+            indent=2,  
+            sort_keys=True,  
+        )  
+        file.write("\n")  
+        file.flush()  
+        os.fsync(file.fileno())  
 
+    os.replace(temporary_path, path)  
 
-def project_lock(state_path: Path) -> threading.RLock:
-    """Return a process-local lock for one project state file."""
-    key = str(state_path.resolve())
-    with _PROJECT_LOCKS_LOCK:
-        return _PROJECT_LOCKS.setdefault(key, threading.RLock())
+    try:  
+        directory_fd = os.open(path.parent, os.O_RDONLY)  
+        try:  
+            os.fsync(directory_fd)  
+        finally:  
+            os.close(directory_fd)  
+    except OSError:  
+        LOGGER.debug("Directory fsync is unavailable for %s", path.parent)  
 
+finally:  
+    try:  
+        temporary_path.unlink(missing_ok=True)  
+    except OSError:  
+        LOGGER.warning("Could not remove temporary state file %s", temporary_path)
 
 @contextmanager
-def locked_project(state_path: Path):
-    """Serialize state updates for one project."""
-    lock = project_lock(state_path)
-    with lock:
-        yield
+def _project_lock(state_path: Path):
+"""Acquire a process-local lock for operations targeting the same state file."""
+lock_key = str(state_path.resolve())
+lock_name = "lock" + hashlib.sha256(lock_key.encode("utf-8")).hexdigest()
 
+with _STATE_LOCKS_GUARD:  
+    lock = _STATE_LOCKS.setdefault(lock_name, threading.RLock())  
 
-def configured_stage_order() -> list[str]:
-    """Load an optional stage order from environment configuration."""
-    raw = os.getenv("CINEMA_STAGE_ORDER")
-    if not raw:
-        return list(DEFAULT_STAGE_ORDER)
+lock.acquire()  
+try:  
+    yield  
+finally:  
+    lock.release()
 
-    try:
-        value = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise PipelineError("CINEMA_STAGE_ORDER must contain a JSON array.") from exc
+_STATE_LOCKS: dict[str, threading.RLock] = {}
+_STATE_LOCKS_GUARD = threading.RLock()
 
-    if (
-        not isinstance(value, list)
-        or not value
-        or not all(isinstance(item, str) and item.strip() for item in value)
-    ):
-        raise PipelineError("CINEMA_STAGE_ORDER must be a non-empty string array.")
+def sha256_file(path: str | Path) -> str:
+"""Calculate the SHA-256 checksum of a file."""
+file_path = Path(path)
 
-    if len(value) != len(set(value)):
-        raise PipelineError("CINEMA_STAGE_ORDER cannot contain duplicate stages.")
+if not file_path.is_file():  
+    raise StateIntegrityError(f"Checksum target is not a file: {file_path}")  
 
-    for stage in value:
-        if stage not in STAGE_MODULES:
-            raise PipelineError(f"Unknown configured stage: {stage}")
+digest = hashlib.sha256()  
 
-    return value
+with file_path.open("rb") as file:  
+    for chunk in iter(lambda: file.read(1024 * 1024), b""):  
+        digest.update(chunk)  
 
+return digest.hexdigest()
+
+def _resolve_path(path: str | Path, base_dir: Path | None = None) -> Path:
+"""Resolve a path, interpreting relative paths against a supplied base."""
+candidate = Path(path).expanduser()
+
+if not candidate.is_absolute():  
+    candidate = (base_dir or ROOT_DIR) / candidate  
+
+return candidate.resolve()
+
+def _assert_within(path: Path, root: Path, description: str) -> Path:
+"""Ensure a resolved path is inside its designated workspace root."""
+resolved_path = path.resolve()
+resolved_root = root.resolve()
+
+try:  
+    resolved_path.relative_to(resolved_root)  
+except ValueError as exc:  
+    raise PipelineError(  
+        f"{description} must remain inside {resolved_root}: {resolved_path}"  
+    ) from exc  
+
+return resolved_path
 
 def _project_workspace(state: dict[str, Any]) -> Path:
-    """Resolve and validate the workspace assigned to a project."""
-    workspace = resolve_path(state["project"]["workspace_dir"])
-    allowed_root = resolve_path(state["project"]["output_root"])
-    if not is_within(workspace, allowed_root):
-        raise StateIntegrityError("Project workspace escapes its output root.")
-    return workspace
+"""Get the project workspace recorded in project state."""
+project = state.get("project", {})
+raw_workspace = project.get("workspace_dir")
 
+if raw_workspace:  
+    return _resolve_path(raw_workspace)  
+
+project_id = state.get("project_id", "unknown")  
+return DEFAULT_OUTPUT_ROOT / "projects" / str(project_id)
 
 def _get_state_path(state: dict[str, Any]) -> Path:
-    """Return the state file path stored in a project record."""
-    path = resolve_path(state["state_path"])
-    workspace = _project_workspace(state)
-    if not is_within(path, workspace):
-        raise StateIntegrityError("Project state path escapes its workspace.")
-    return path
+"""Get the canonical project-state path recorded in the state object."""
+raw_path = state.get("state_path")
 
+if raw_path:  
+    return _resolve_path(raw_path)  
 
-def _default_stage_record() -> dict[str, Any]:
-    """Create a consistent initial stage record."""
-    return {
-        "status": "pending",
-        "started_at": None,
-        "completed_at": None,
-        "duration_seconds": None,
-        "attempts": 0,
-        "artifacts": [],
-        "error": None,
-    }
+return _project_workspace(state) / STATE_FILENAME
 
+def _normalize_stage_record(stage: str) -> dict[str, Any]:
+"""Create the default record for a pipeline stage."""
+return {
+"name": stage,
+"status": "pending",
+"attempts": 0,
+"started_at": None,
+"completed_at": None,
+"input": {},
+"outputs": {},
+"artifacts": [],
+"error": None,
+"duration_seconds": None,
+}
 
 def _default_project_state(
-    project_id: str,
-    topic: str,
-    language: str,
-    profile: str,
-    workspace: Path,
-    output_root: Path,
-    test_mode: bool,
-    stage_order: list[str],
+project_id: str,
+topic: str,
+language: str,
+profile: str,
+workspace_dir: Path,
+state_path: Path,
+test_mode: bool,
 ) -> dict[str, Any]:
-    """Create the canonical project state."""
-    now = utc_now()
-    return {
-        "state_version": STATE_VERSION,
-        "project_id": project_id,
-        "job_id": project_id,
-        "revision": 0,
-        "status": "created",
-        "created_at": now,
-        "updated_at": now,
-        "state_path": str(workspace / STATE_FILENAME),
-        "project": {
-            "topic": topic,
-            "language": language,
-            "profile": profile,
-            "profile_settings": PROFILES[profile].copy(),
-            "workspace_dir": str(workspace),
-            "output_root": str(output_root),
-            "test_mode": bool(test_mode),
-        },
-        "pipeline": {
-            "stage_order": list(stage_order),
-            "current_stage": None,
-            "completed_stages": [],
-            "failed_stage": None,
-            "cancel_reason": None,
-            "started_at": None,
-            "completed_at": None,
-            "duration_seconds": None,
-            "last_error": None,
-        },
-        "stages": {
-            stage: _default_stage_record()
-            for stage in stage_order
-        },
-        "artifacts": {},
-        "integrity": {
-            "algorithm": "sha256",
-            "state_revision": 0,
-            "last_verified_at": None,
-        },
-        "recovery": {
-            "recovered_at": None,
-            "invalidated_stages": [],
-        },
-    }
-
+"""Create the canonical project state structure."""
+return {
+"schema_version": STATE_VERSION,
+"project_id": project_id,
+"state_path": str(state_path.resolve()),
+"status": "created",
+"created_at": utc_now(),
+"updated_at": utc_now(),
+"test_mode": bool(test_mode),
+"project": {
+"topic": topic,
+"language": language,
+"profile": profile,
+"profile_settings": dict(PROFILE_DEFAULTS[profile]),
+"workspace_dir": str(workspace_dir.resolve()),
+"output_root": str(workspace_dir.resolve()),
+},
+"pipeline": {
+"stage_order": list(STAGE_ORDER),
+"current_stage": None,
+"completed_stages": [],
+"failed_stage": None,
+"cancel_reason": None,
+"started_at": None,
+"completed_at": None,
+"duration_seconds": None,
+"last_error": None,
+},
+"stages": {
+stage: _normalize_stage_record(stage)
+for stage in STAGE_ORDER
+},
+"artifacts": {},
+"integrity": {
+"algorithm": "sha256",
+"state_revision": 0,
+"last_verified_at": None,
+},
+"recovery": {
+"recovered_at": None,
+"actions": [],
+},
+}
 
 def _validate_state_shape(state: dict[str, Any]) -> None:
-    """Validate required state fields before using project data."""
-    required = {
-        "project_id", "job_id", "status", "project",
-        "pipeline", "stages", "state_path",
-    }
-    missing = required.difference(state)
-    if missing:
-        raise StateIntegrityError(
-            f"Project state is missing required fields: {sorted(missing)}"
-        )
+"""Validate the minimum required structure for a project state."""
+if not isinstance(state, dict):
+raise StateIntegrityError("Project state must be a JSON object")
 
-    if state["status"] not in VALID_STATES:
-        raise StateIntegrityError(
-            f"Unsupported project status: {state['status']}"
-        )
+if not state.get("project_id"):  
+    raise StateIntegrityError("Project state is missing project_id")  
 
-    if not isinstance(state["project"], dict):
-        raise StateIntegrityError("Project configuration must be an object.")
-    if not isinstance(state["pipeline"], dict):
-        raise StateIntegrityError("Pipeline state must be an object.")
-    if not isinstance(state["stages"], dict):
-        raise StateIntegrityError("Stages state must be an object.")
+project = state.get("project")  
+if not isinstance(project, dict):  
+    raise StateIntegrityError("Project state is missing its project object")  
 
+pipeline = state.get("pipeline")  
+if not isinstance(pipeline, dict):  
+    raise StateIntegrityError("Project state is missing its pipeline object")  
 
-def save_project_state(state: dict[str, Any]) -> dict[str, Any]:
-    """Update revision metadata and atomically persist project state."""
-    _validate_state_shape(state)
-    state_path = _get_state_path(state)
+stages = state.get("stages")  
+if not isinstance(stages, dict):  
+    raise StateIntegrityError("Project state is missing its stages object")  
 
-    with locked_project(state_path):
-        state["updated_at"] = utc_now()
-        state["revision"] = int(state.get("revision", 0)) + 1
-        state.setdefault("integrity", {})
-        state["integrity"]["algorithm"] = "sha256"
-        state["integrity"]["state_revision"] = state["revision"]
-        atomic_write_json(state_path, state)
+for stage in STAGE_ORDER:  
+    if stage not in stages or not isinstance(stages[stage], dict):  
+        raise StateIntegrityError(f"Project state is missing stage record: {stage}")
 
-    return state
+def _artifact_record(path: Path, kind: str | None = None) -> dict[str, Any]:
+"""Create a manifest record for an existing artifact."""
+if not path.is_file():
+raise StateIntegrityError(f"Expected artifact does not exist: {path}")
 
-
-def load_project_state(state_path: str | Path) -> dict[str, Any]:
-    """Load and validate a project's persistent state."""
-    path = resolve_path(state_path)
-    state = read_json(path)
-    _validate_state_shape(state)
-
-    if resolve_path(state["state_path"]) != path:
-        raise StateIntegrityError("Recorded state path does not match loaded file.")
-
-    _project_workspace(state)
-    state.setdefault("artifacts", {})
-    state.setdefault("integrity", {})
-    state.setdefault("recovery", {})
-    return state
-
-
-def _register_job(job_id: str, state_path: Path) -> None:
-    """Register a pipeline job for API and CLI access."""
-    with _ACTIVE_JOBS_LOCK:
-        _ACTIVE_JOBS[job_id] = {"state_path": str(state_path)}
-    with _CANCEL_LOCK:
-        _CANCEL_EVENTS.setdefault(job_id, threading.Event())
-
-
-def _cancel_event(job_id: str) -> threading.Event:
-    """Return or create a cancellation event for a job."""
-    with _CANCEL_LOCK:
-        return _CANCEL_EVENTS.setdefault(job_id, threading.Event())
-
-
-def _check_cancelled(job_id: str) -> None:
-    """Raise when the job has been cancelled."""
-    if _cancel_event(job_id).is_set():
-        raise PipelineCancelled(
-            f"Cancellation requested for pipeline job {job_id}."
-        )
-
-
-# ---------------------------------------------------------------------------
-# Project creation and artifact handling
-# ---------------------------------------------------------------------------
-
-def create_project(
-    topic: str,
-    language: str = "Hindi",
-    profile: str = "reel",
-    output_root: str | Path | None = None,
-    test_mode: bool = False,
-) -> dict[str, Any]:
-    """Create an isolated project and register it immediately."""
-    topic = str(topic).strip()
-    language = str(language).strip()
-    profile = str(profile).strip().lower()
-
-    if not topic:
-        raise ValueError("topic must not be empty.")
-    if not language:
-        raise ValueError("language must not be empty.")
-    if profile not in PROFILES:
-        raise ValueError(f"Unsupported profile: {profile}")
-
-    root = resolve_path(output_root or DEFAULT_OUTPUT_ROOT)
-    root.mkdir(parents=True, exist_ok=True)
-
-    project_id = f"cinema-{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:10]}"
-    workspace = root / "projects" / project_id
-    workspace.mkdir(parents=True, exist_ok=False)
-
-    for stage in configured_stage_order():
-        directory = STAGE_DIRECTORIES.get(stage, f"stages/{stage}")
-        (workspace / directory).mkdir(parents=True, exist_ok=True)
-
-    state = _default_project_state(
-        project_id=project_id,
-        topic=topic,
-        language=language,
-        profile=profile,
-        workspace=workspace,
-        output_root=root,
-        test_mode=test_mode,
-        stage_order=configured_stage_order(),
-    )
-    state_path = workspace / STATE_FILENAME
-    atomic_write_json(state_path, state)
-    _register_job(project_id, state_path)
-
-    logger.info("Created project %s at %s", project_id, workspace)
-    return state
-
-
-def _artifact_record(path: Path, workspace: Path) -> dict[str, Any]:
-    """Create a checksum record for a workspace artifact."""
-    resolved = path.resolve(strict=True)
-    if not resolved.is_file() or not is_within(resolved, workspace):
-        raise StateIntegrityError(f"Artifact is outside project workspace: {path}")
-
-    stat = resolved.stat()
-    return {
-        "path": str(resolved),
-        "name": resolved.name,
-        "size_bytes": stat.st_size,
-        "sha256": sha256_file(resolved),
-        "modified_at": datetime.fromtimestamp(
-            stat.st_mtime, timezone.utc
-        ).isoformat(),
-    }
-
+return {  
+    "path": str(path.resolve()),  
+    "sha256": sha256_file(path),  
+    "size_bytes": path.stat().st_size,  
+    "kind": kind or path.suffix.lstrip(".") or "file",  
+    "verified_at": utc_now(),  
+}
 
 def _verify_artifact_record(
-    record: dict[str, Any],
-    workspace: Path,
+artifact: dict[str, Any],
+*,
+required: bool = True,
 ) -> bool:
-    """Verify an artifact's path, size and checksum."""
-    try:
-        path = resolve_path(record["path"])
-        if not is_within(path, workspace) or not path.is_file():
-            return False
-        if path.stat().st_size != int(record["size_bytes"]):
-            return False
-        return sha256_file(path) == record["sha256"]
-    except (KeyError, OSError, TypeError, ValueError):
-        return False
+"""Verify an artifact manifest record against the file on disk."""
+raw_path = artifact.get("path")
+expected_checksum = artifact.get("sha256")
 
+if not raw_path:  
+    if required:  
+        raise StateIntegrityError("Artifact record is missing its path")  
+    return False  
+
+path = _resolve_path(raw_path)  
+
+if not path.is_file():  
+    if required:  
+        raise StateIntegrityError(f"Artifact file is missing: {path}")  
+    return False  
+
+if expected_checksum:  
+    actual_checksum = sha256_file(path)  
+    if actual_checksum.lower() != str(expected_checksum).lower():  
+        raise StateIntegrityError(  
+            f"SHA-256 mismatch for {path}: expected {expected_checksum}, "  
+            f"got {actual_checksum}"  
+        )  
+
+expected_size = artifact.get("size_bytes")  
+if expected_size is not None and path.stat().st_size != int(expected_size):  
+    raise StateIntegrityError(f"Artifact size mismatch for {path}")  
+
+return True
+
+def create_project(
+topic: str,
+language: str,
+profile: str,
+output_root: str | Path,
+test_mode: bool,
+) -> dict[str, Any]:
+"""Create a project workspace and its canonical project_state.json."""
+topic = str(topic).strip()
+language = str(language).strip()
+profile = str(profile).strip().lower()
+
+if not topic:  
+    raise ValueError("topic must not be empty")  
+
+if not language:  
+    raise ValueError("language must not be empty")  
+
+if profile not in PROFILE_DEFAULTS:  
+    raise ValueError(  
+        f"Unsupported profile '{profile}'. Choose one of: "  
+        f"{', '.join(PROFILE_DEFAULTS)}"  
+    )  
+
+output_path = _resolve_path(output_root)  
+output_path.mkdir(parents=True, exist_ok=True)  
+
+project_id = f"cinema-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"  
+workspace_dir = output_path / "projects" / project_id  
+workspace_dir.mkdir(parents=True, exist_ok=False)  
+
+for relative_dir in (  
+    "01_research_vault",  
+    "02_screenplay_desk",  
+    "03_audio_studio",  
+    "04_visual_lab",  
+    "05_master_theater",  
+    "state",  
+):  
+    (workspace_dir / relative_dir).mkdir(parents=True, exist_ok=True)  
+
+state_path = workspace_dir / STATE_FILENAME  
+state = _default_project_state(  
+    project_id=project_id,  
+    topic=topic,  
+    language=language,  
+    profile=profile,  
+    workspace_dir=workspace_dir,  
+    state_path=state_path,  
+    test_mode=test_mode,  
+)  
+
+state["project"]["output_root"] = str(output_path.resolve())  
+save_project_state(state_path, state)  
+
+LOGGER.info("Created project %s", project_id)  
+return state
+
+def load_project_state(state_path: str | Path) -> dict[str, Any]:
+"""Load and validate project state from its canonical JSON file."""
+path = _resolve_path(state_path)
+
+if not path.is_file():  
+    raise FileNotFoundError(f"Project state file not found: {path}")  
+
+state = _read_json(path)  
+_validate_state_shape(state)  
+
+recorded_path = state.get("state_path")  
+if recorded_path:  
+    expected_path = _resolve_path(recorded_path)  
+    if expected_path != path:  
+        raise StateIntegrityError(  
+            f"State path mismatch: file is {path}, but state records {expected_path}"  
+        )  
+
+state.setdefault("integrity", {})  
+state["integrity"].setdefault("algorithm", "sha256")  
+state["integrity"].setdefault("state_revision", 0)  
+
+for stage in STAGE_ORDER:  
+    state["stages"][stage].setdefault("artifacts", [])  
+    state["stages"][stage].setdefault("outputs", {})  
+    state["stages"][stage].setdefault("attempts", 0)  
+
+return state
+
+def save_project_state(
+state_path: str | Path,
+state: dict[str, Any],
+) -> dict[str, Any]:
+"""Atomically persist project state; this module is its sole writer."""
+path = _resolve_path(state_path)
+_validate_state_shape(state)
+
+state["state_path"] = str(path)  
+state["updated_at"] = utc_now()  
+
+integrity = state.setdefault("integrity", {})  
+integrity["algorithm"] = "sha256"  
+integrity["state_revision"] = int(integrity.get("state_revision", 0)) + 1  
+
+_atomic_write_json(path, state)  
+return state
+
+def _cancel_event(job_id: str) -> threading.Event:
+"""Get or create a cancellation event for a job."""
+with _CANCEL_EVENTS_LOCK:
+return _CANCEL_EVENTS.setdefault(job_id, threading.Event())
+
+def _check_cancelled(job_id: str) -> None:
+"""Raise an exception if the job has been cancelled."""
+if _cancel_event(job_id).is_set():
+with _ACTIVE_JOBS_LOCK:
+record = _ACTIVE_JOBS.get(job_id, {})
+reason = record.get("cancel_reason") or "Cancelled by caller"
+
+raise PipelineCancelled(f"Pipeline {job_id} cancelled: {reason}")
 
 def _write_json_artifact(path: Path, data: dict[str, Any]) -> Path:
-    """Write a stage JSON output atomically."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(path, data)
-    return path.resolve()
+"""Write a stage JSON artifact atomically."""
+path.parent.mkdir(parents=True, exist_ok=True)
+_atomic_write_json(path, data)
+return path
 
+def _extract_scenes(blueprint: dict[str, Any]) -> list[dict[str, Any]]:
+"""Extract scene records from a screenplay blueprint."""
+scenes = blueprint.get("scenes")
 
-def _stage_workspace(state: dict[str, Any], stage: str) -> Path:
-    """Resolve the output directory for one stage."""
-    workspace = _project_workspace(state)
-    directory = STAGE_DIRECTORIES.get(stage, f"stages/{stage}")
-    path = (workspace / directory).resolve()
-    if not is_within(path, workspace):
-        raise StateIntegrityError(f"Unsafe stage directory: {stage}")
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+if not isinstance(scenes, list):  
+    screenplay = blueprint.get("screenplay")  
+    if isinstance(screenplay, dict):  
+        scenes = screenplay.get("scenes")  
 
+if not isinstance(scenes, list):  
+    scenes = []  
 
-def _find_artifacts(state: dict[str, Any], stage: str) -> list[Path]:
-    """Find current files produced in a stage directory."""
-    directory = _stage_workspace(state, stage)
-    results = []
-    for path in directory.rglob("*"):
-        if path.is_file() and path.name != STATE_FILENAME:
-            if is_within(path, _project_workspace(state)):
-                results.append(path.resolve())
-    return sorted(results, key=lambda item: item.stat().st_mtime)
+normalized = []  
+for index, scene in enumerate(scenes):  
+    if isinstance(scene, dict):  
+        normalized.append(scene)  
+    else:  
+        normalized.append({"scene_number": index + 1, "text": str(scene)})  
 
+return normalized
+
+def _load_stage_module(module_name: str):
+"""Import a stage module from the project root."""
+import importlib
+
+if str(ROOT_DIR) not in sys.path:  
+    sys.path.insert(0, str(ROOT_DIR))  
+
+try:  
+    return importlib.import_module(module_name)  
+except Exception as exc:  
+    raise StageExecutionError(  
+        f"Could not import stage module '{module_name}': {exc}"  
+    ) from exc
+
+def _call_supported(function: Callable[..., Any], kwargs: dict[str, Any]) -> Any:
+"""Call a stage function with only the keyword arguments it accepts."""
+import inspect
+
+try:  
+    signature = inspect.signature(function)  
+except (TypeError, ValueError):  
+    return function(**kwargs)  
+
+if any(  
+    parameter.kind == inspect.Parameter.VAR_KEYWORD  
+    for parameter in signature.parameters.values()  
+):  
+    return function(**kwargs)  
+
+filtered = {  
+    key: value  
+    for key, value in kwargs.items()  
+    if key in signature.parameters  
+}  
+return function(**filtered)
+
+def _invoke_stage_entrypoint(
+module: Any,
+entrypoint_names: tuple[str, ...],
+kwargs: dict[str, Any],
+) -> Any:
+"""Invoke the first available stage entrypoint."""
+for name in entrypoint_names:
+function = getattr(module, name, None)
+if callable(function):
+return _call_supported(function, kwargs)
+
+raise StageExecutionError(  
+    f"Stage module {module.__name__} has none of these entrypoints: "  
+    f"{', '.join(entrypoint_names)}"  
+)
+
+def _find_artifacts(
+result: Any,
+candidate_roots: list[Path],
+) -> list[Path]:
+"""Find artifact paths returned by a stage or written in its output directories."""
+found: dict[str, Path] = {}
+
+def visit(value: Any) -> None:  
+    if isinstance(value, Path):  
+        if value.is_file():  
+            found[str(value.resolve())] = value.resolve()  
+        return  
+
+    if isinstance(value, str):  
+        candidate = Path(value).expanduser()  
+        if not candidate.is_absolute():  
+            candidate = ROOT_DIR / candidate  
+        try:  
+            resolved = candidate.resolve()  
+            if resolved.is_file():  
+                found[str(resolved)] = resolved  
+        except OSError:  
+            pass  
+        return  
+
+    if isinstance(value, dict):  
+        for key, item in value.items():  
+            if key in {"path", "file", "file_path", "output_path"}:  
+                visit(item)  
+            elif isinstance(item, (dict, list, tuple, Path)):  
+                visit(item)  
+        return  
+
+    if isinstance(value, (list, tuple)):  
+        for item in value:  
+            visit(item)  
+
+visit(result)  
+
+for root in candidate_roots:  
+    if root.exists():  
+        for path in root.rglob("*"):  
+            if path.is_file() and not path.name.startswith("."):  
+                found[str(path.resolve())] = path.resolve()  
+
+return sorted(found.values(), key=lambda item: str(item))
+
+def _stage_workspace(state: dict[str, Any], stage_name: str) -> Path:
+"""Return the expected output workspace for a stage."""
+workspace = _project_workspace(state)
+
+mapping = {  
+    "slot1_research": "01_research_vault",  
+    "slot2_screenplay": "02_screenplay_desk",  
+    "slot4_audio": "03_audio_studio",  
+    "slot3_visuals": "04_visual_lab",  
+    "slot5_editor": "05_master_theater",  
+}  
+
+return workspace / mapping[stage_name]
 
 def _locate_latest_artifact(
-    state: dict[str, Any],
-    stages: list[str],
-    patterns: tuple[str, ...],
-    suffixes: tuple[str, ...] = (".json",),
+roots: list[Path],
+suffixes: tuple[str, ...] = (".json",),
+exclude: set[str] | None = None,
 ) -> Path | None:
-    """Find the latest matching artifact from preceding stages."""
-    matches: list[Path] = []
-    for stage in stages:
-        for path in _find_artifacts(state, stage):
-            if path.suffix.lower() not in suffixes:
-                continue
-            name = path.name.lower()
-            if any(pattern in name for pattern in patterns):
-                matches.append(path)
-    if not matches:
-        return None
-    return max(matches, key=lambda item: item.stat().st_mtime)
+"""Locate the most recently modified artifact with a matching extension."""
+excluded = exclude or set()
+candidates: list[Path] = []
 
+for root in roots:  
+    if not root.exists():  
+        continue  
+    for path in root.rglob("*"):  
+        if (  
+            path.is_file()  
+            and path.suffix.lower() in suffixes  
+            and path.name not in excluded  
+            and not path.name.startswith(".")  
+        ):  
+            candidates.append(path)  
 
-def _invoke_supported(function: Callable[..., Any], values: dict[str, Any]) -> Any:
-    """Call a slot using only accepted keyword arguments."""
-    signature = inspect.signature(function)
-    parameters = signature.parameters
+if not candidates:  
+    return None  
 
-    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
-        return function(**values)
-
-    kwargs = {
-        name: value
-        for name, value in values.items()
-        if name in parameters
-        and parameters[name].kind
-        in {
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            inspect.Parameter.KEYWORD_ONLY,
-        }
-    }
-
-    required = [
-        name
-        for name, parameter in parameters.items()
-        if parameter.default is inspect.Parameter.empty
-        and parameter.kind
-        in {
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            inspect.Parameter.KEYWORD_ONLY,
-        }
-        and name not in kwargs
-    ]
-    if required:
-        raise StageExecutionError(
-            f"{function.__module__}.{function.__name__} requires unsupported "
-            f"arguments: {required}"
-        )
-
-    return function(**kwargs)
-
-
-# ---------------------------------------------------------------------------
-# Offline test mode
-# ---------------------------------------------------------------------------
+return max(candidates, key=lambda item: item.stat().st_mtime)
 
 def _run_test_stage(
-    state: dict[str, Any],
-    stage: str,
-    output_dir: Path,
-) -> list[Path]:
-    """Produce deterministic offline fixtures for one stage."""
-    project = state["project"]
-    profile = project["profile_settings"]
-    topic = project["topic"]
-    language = project["language"]
-    previous = state["pipeline"]["completed_stages"]
+state: dict[str, Any],
+stage_name: str,
+stage_input: dict[str, Any],
+) -> dict[str, Any]:
+"""Produce deterministic lightweight artifacts for offline CI test mode."""
+output_dir = _stage_workspace(state, stage_name)
+output_dir.mkdir(parents=True, exist_ok=True)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+project = state["project"]  
+topic = project["topic"]  
+language = project["language"]  
+profile = project["profile"]  
+profile_settings = project.get("profile_settings", PROFILE_DEFAULTS[profile])  
 
-    if stage == "slot1_research":
-        path = output_dir / "research_output.json"
-        _write_json_artifact(path, {
-            "topic": topic,
-            "language": language,
-            "test_mode": True,
-            "sources": [],
-            "summary": f"Offline research fixture for: {topic}",
-            "created_at": utc_now(),
-        })
-        return [path]
+if stage_name == "slot1_research":  
+    output_path = output_dir / "research_output.json"  
+    payload = {  
+        "schema_version": "1.0.0",  
+        "project_id": state["project_id"],  
+        "topic": topic,  
+        "language": language,  
+        "profile": profile,  
+        "summary": f"Offline research brief for: {topic}",  
+        "key_points": [  
+            f"Introduce the central idea: {topic}",  
+            "Provide concise supporting context",  
+            "End with a clear narrative takeaway",  
+        ],  
+        "sources": [],  
+        "test_mode": True,  
+        "created_at": utc_now(),  
+    }  
 
-    if stage == "slot2_screenplay":
-        path = output_dir / "screenplay_blueprint.json"
-        _write_json_artifact(path, {
-            "topic": topic,
-            "language": language,
-            "profile": project["profile"],
-            "target_duration_seconds": profile["duration_seconds"],
-            "scenes": [
-                {
-                    "scene_id": "scene-001",
-                    "title": topic,
-                    "description": f"Test scene for {topic}",
-                    "duration_seconds": profile["duration_seconds"],
-                }
-            ],
-            "test_mode": True,
-            "upstream_stages": previous,
-        })
-        return [path]
+elif stage_name == "slot2_screenplay":  
+    research_path = stage_input.get("research_path")  
+    research = _read_json(Path(research_path)) if research_path else {}  
 
-    if stage == "slot4_audio":
-        path = output_dir / "audio_timeline.json"
-        _write_json_artifact(path, {
-            "topic": topic,
-            "language": language,
-            "duration_seconds": profile["duration_seconds"],
-            "voice": "default",
-            "segments": [],
-            "test_mode": True,
-        })
-        return [path]
+    output_path = output_dir / "screenplay_blueprint.json"  
+    target_duration = int(profile_settings.get("duration_seconds", 15))  
+    scene_count = 3 if target_duration >= 10 else 1  
+    scene_duration = max(1, target_duration // scene_count)  
+    scenes = []  
 
-    if stage == "slot3_visuals":
-        frame = output_dir / "test_scene_001.ppm"
-        width, height = 64, 64
-        frame.write_bytes(
-            f"P6\n{width} {height}\n255\n".encode("ascii")
-            + bytes([24, 32, 64]) * width * height
-        )
-        manifest = output_dir / "visual_manifest.json"
-        _write_json_artifact(manifest, {
-            "topic": topic,
-            "language": language,
-            "frames": [str(frame.resolve())],
-            "test_mode": True,
-        })
-        return [manifest, frame]
+    for index in range(scene_count):  
+        scenes.append(  
+            {  
+                "scene_number": index + 1,  
+                "title": f"Scene {index + 1}",  
+                "duration_seconds": scene_duration,  
+                "narration": (  
+                    f"{topic}. "  
+                    f"{research.get('key_points', ['A cinematic introduction'])[index % 3]}."  
+                ),  
+                "visual_prompt": (  
+                    f"Cinematic shot about {topic}, scene {index + 1}, "  
+                    "coherent lighting, clear subject, no on-screen text"  
+                ),  
+                "shot_type": ("wide", "medium", "close-up")[index % 3],  
+            }  
+        )  
 
-    if stage == "slot5_editor":
-        path = output_dir / "test_export_spec.json"
-        _write_json_artifact(path, {
-            "topic": topic,
-            "profile": project["profile"],
-            "width": profile["width"],
-            "height": profile["height"],
-            "duration_seconds": profile["duration_seconds"],
-            "test_mode": True,
-            "export_pending": True,
-        })
-        return [path]
+    actual_duration = sum(  
+        int(scene["duration_seconds"]) for scene in scenes  
+    )  
 
-    raise StageExecutionError(f"No test fixture is defined for stage: {stage}")
+    payload = {  
+        "schema_version": "1.0.0",  
+        "project_id": state["project_id"],  
+        "topic": topic,  
+        "language": language,  
+        "profile": profile,  
+        "title": topic,  
+        "duration_seconds": actual_duration,  
+        "aspect_ratio": profile_settings.get("aspect_ratio", "9:16"),  
+        "resolution": profile_settings.get("resolution", "720x1280"),  
+        "scenes": scenes,  
+        "test_mode": True,  
+        "created_at": utc_now(),  
+    }  
 
+elif stage_name == "slot4_audio":  
+    screenplay_path = stage_input.get("screenplay_path")  
+    blueprint = _read_json(Path(screenplay_path)) if screenplay_path else {}  
+    scenes = _extract_scenes(blueprint)  
 
-def _create_test_video(state: dict[str, Any]) -> Path:
-    """Create and verify a small MP4 test render using FFmpeg."""
-    workspace = _project_workspace(state)
-    settings = state["project"]["profile_settings"]
-    output_dir = _stage_workspace(state, "slot5_editor")
-    output_path = output_dir / "cinema_test_export.mp4"
+    timeline_segments = []  
+    cursor = 0.0  
 
-    ffmpeg = shutil.which(os.getenv("CINEMA_FFMPEG", "ffmpeg"))
-    ffprobe = shutil.which(os.getenv("CINEMA_FFPROBE", "ffprobe"))
+    for index, scene in enumerate(scenes):  
+        duration = max(1.0, float(scene.get("duration_seconds", 1)))  
+        narration = str(  
+            scene.get("narration")  
+            or scene.get("dialogue")  
+            or scene.get("text")  
+            or topic  
+        )  
 
-    if not ffmpeg or not ffprobe:
-        raise StageExecutionError(
-            "Test video export requires both FFmpeg and FFprobe."
-        )
+        timeline_segments.append(  
+            {  
+                "segment_id": f"narration-{index + 1:03d}",  
+                "scene_number": index + 1,  
+                "start_seconds": round(cursor, 3),  
+                "end_seconds": round(cursor + duration, 3),  
+                "duration_seconds": duration,  
+                "text": narration,  
+                "audio_path": None,  
+                "test_mode": True,  
+            }  
+        )  
+        cursor += duration  
 
-    width = int(settings["width"])
-    height = int(settings["height"])
-    duration = max(1, min(int(settings["duration_seconds"]), 5))
+    output_path = output_dir / "audio_timeline.json"  
+    payload = {  
+        "schema_version": "1.0.0",  
+        "project_id": state["project_id"],  
+        "duration_seconds": cursor,  
+        "language": language,  
+        "segments": timeline_segments,  
+        "events": timeline_segments,  
+        "music": [],  
+        "sound_effects": [],  
+        "test_mode": True,  
+        "created_at": utc_now(),  
+    }  
 
-    command = [
-        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-        "-f", "lavfi",
-        "-i", f"color=c=0x182040:s={width}x{height}:d={duration}:r=24",
-        "-an",
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        str(output_path),
-    ]
+elif stage_name == "slot3_visuals":  
+    screenplay_path = stage_input.get("screenplay_path")  
+    timeline_path = stage_input.get("timeline_path")  
 
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        timeout=max(60, duration * 20),
-        check=False,
-    )
-    if result.returncode != 0:
-        raise StageExecutionError(
-            f"FFmpeg test export failed: {result.stderr[-2000:]}"
-        )
+    blueprint = _read_json(Path(screenplay_path)) if screenplay_path else {}  
+    timeline = _read_json(Path(timeline_path)) if timeline_path else {}  
+    scenes = _extract_scenes(blueprint)  
 
-    probe = subprocess.run(
-        [
-            ffprobe, "-v", "error",
-            "-show_entries", "format=duration:stream=codec_type,width,height",
-            "-of", "json", str(output_path),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    if probe.returncode != 0:
-        raise StageExecutionError("FFprobe could not validate the test video.")
+    duration = float(  
+        timeline.get("duration_seconds")  
+        or blueprint.get("duration_seconds")  
+        or sum(float(scene.get("duration_seconds", 1)) for scene in scenes)  
+    )  
 
-    try:
-        metadata = json.loads(probe.stdout)
-        if not metadata.get("streams") or not metadata.get("format"):
-            raise ValueError("Missing stream or format metadata.")
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise StageExecutionError("Test video metadata is invalid.") from exc
+    output_path = output_dir / "visual_manifest.json"  
+    frame_records = []  
+    cursor = 0.0  
 
-    if not is_within(output_path, workspace) or output_path.stat().st_size == 0:
-        raise StateIntegrityError("Test export failed workspace validation.")
+    for index, scene in enumerate(scenes):  
+        scene_duration = max(1.0, float(scene.get("duration_seconds", 1)))  
+        frame_path = output_dir / f"scene_{index + 1:03d}.ppm"  
 
-    return output_path.resolve()
+        # PPM is a valid, dependency-free image format for lightweight CI.  
+        width, height = 32, 32  
+        color = (  
+            (index * 67 + 40) % 256,  
+            (index * 97 + 80) % 256,  
+            (index * 127 + 120) % 256,  
+        )  
+        header = f"P6\n{width} {height}\n255\n".encode("ascii")  
+        pixel = bytes(color)  
+        image_data = header + pixel * (width * height)  
 
+        temporary = frame_path.with_suffix(".ppm.tmp")  
+        temporary.write_bytes(image_data)  
+        os.replace(temporary, frame_path)  
 
-# ---------------------------------------------------------------------------
-# Production slot dispatch
-# ---------------------------------------------------------------------------
+        frame_records.append(  
+            {  
+                "scene_number": index + 1,  
+                "start_seconds": round(cursor, 3),  
+                "end_seconds": round(min(cursor + scene_duration, duration), 3),  
+                "duration_seconds": min(scene_duration, max(0.0, duration - cursor)),  
+                "frame_path": str(frame_path.resolve()),  
+                "sha256": sha256_file(frame_path),  
+                "visual_prompt": scene.get("visual_prompt", topic),  
+            }  
+        )  
+        cursor += scene_duration  
 
-def _resolve_stage_inputs(
-    state: dict[str, Any],
-    stage: str,
-) -> dict[str, Path | None]:
-    """Resolve the inputs required by a stage from completed predecessors."""
-    completed = state["pipeline"]["completed_stages"]
+    payload = {  
+        "schema_version": "1.0.0",  
+        "project_id": state["project_id"],  
+        "duration_seconds": duration,  
+        "frames": frame_records,  
+        "scenes": frame_records,  
+        "motion": [],  
+        "test_mode": True,  
+        "created_at": utc_now(),  
+    }  
 
-    research = _locate_latest_artifact(
-        state, completed, ("research_output", "research"),
-    )
-    screenplay = _locate_latest_artifact(
-        state, completed, ("screenplay_blueprint", "screenplay"),
-    )
-    timeline = _locate_latest_artifact(
-        state, completed, ("audio_timeline", "timeline"),
-    )
-    visuals = _locate_latest_artifact(
-        state, completed, ("visual_manifest", "visual"),
-    )
+elif stage_name == "slot5_editor":  
+    output_path = output_dir / "test_export_spec.json"  
+    screenplay_path = stage_input.get("screenplay_path")  
+    timeline_path = stage_input.get("timeline_path")  
+    visual_manifest_path = stage_input.get("visual_manifest_path")  
 
-    return {
-        "research": research,
-        "screenplay": screenplay,
-        "timeline": timeline,
-        "visual_manifest": visuals,
-    }
+    blueprint = _read_json(Path(screenplay_path)) if screenplay_path else {}  
+    timeline = _read_json(Path(timeline_path)) if timeline_path else {}  
+    visual_manifest = (  
+        _read_json(Path(visual_manifest_path))  
+        if visual_manifest_path  
+        else {}  
+    )  
 
+    duration = float(  
+        timeline.get("duration_seconds")  
+        or blueprint.get("duration_seconds")  
+        or profile_settings.get("duration_seconds", 15)  
+    )  
+
+    payload = {  
+        "schema_version": "1.0.0",  
+        "project_id": state["project_id"],  
+        "title": topic,  
+        "language": language,  
+        "profile": profile,  
+        "duration_seconds": duration,  
+        "expected_export_path": str(  
+            (output_dir / "final_video.mp4").resolve()  
+        ),  
+        "screenplay_path": screenplay_path,  
+        "timeline_path": timeline_path,  
+        "visual_manifest_path": visual_manifest_path,  
+        "scene_count": len(_extract_scenes(blueprint)),  
+        "visual_count": len(  
+            visual_manifest.get("frames", visual_manifest.get("scenes", []))  
+        ),  
+        "test_mode": True,  
+        "created_at": utc_now(),  
+    }  
+
+else:  
+    raise StageExecutionError(f"No offline test handler for {stage_name}")  
+
+_write_json_artifact(output_path, payload)  
+
+return {  
+    "status": "completed",  
+    "outputs": {  
+        "primary": str(output_path.resolve()),  
+        "duration_seconds": payload.get("duration_seconds"),  
+    },  
+    "artifacts": [str(output_path.resolve())],  
+    "test_mode": True,  
+}
 
 def _run_production_stage(
-    state: dict[str, Any],
-    stage: str,
-    output_dir: Path,
-) -> list[Path]:
-    """Invoke a production slot with its supported arguments."""
-    module_name, entrypoint_name = STAGE_MODULES[stage]
-    module = importlib.import_module(module_name)
-    function = getattr(module, entrypoint_name, None)
+state: dict[str, Any],
+stage_name: str,
+stage_input: dict[str, Any],
+) -> dict[str, Any]:
+"""Execute the actual stage module using its public entrypoint."""
+project = state["project"]
+output_dir = _stage_workspace(state, stage_name)
+output_dir.mkdir(parents=True, exist_ok=True)
 
-    if not callable(function):
-        raise StageExecutionError(
-            f"Entry point {entrypoint_name!r} is missing in {module_name!r}."
-        )
+common = {  
+    "topic": project["topic"],  
+    "language": project["language"],  
+    "profile": project["profile"],  
+    "output_root": str(project.get("output_root", output_dir)),  
+    "output_dir": str(output_dir),  
+    "test_mode": False,  
+    "project_id": state["project_id"],  
+}  
 
-    project = state["project"]
-    profile_settings = project["profile_settings"]
-    inputs = _resolve_stage_inputs(state, stage)
-    workspace = _project_workspace(state)
+if stage_name == "slot1_research":  
+    module = _load_stage_module("slot1_research")  
+    kwargs = {  
+        **common,  
+        "topic": project["topic"],  
+        "language": project["language"],  
+        "profile": project["profile"],  
+        "output_dir": str(output_dir),  
+    }  
+    result = _invoke_stage_entrypoint(  
+        module,  
+        ("run_research", "run", "research_topic", "execute"),  
+        kwargs,  
+    )  
 
-    common = {
-        "topic": project["topic"],
-        "language": project["language"],
-        "profile": project["profile"],
-        "output_root": str(workspace),
-        "output_dir": str(output_dir),
-        "test_mode": False,
-        "project_id": state["project_id"],
-        "target_duration_seconds": profile_settings["duration_seconds"],
-    }
+elif stage_name == "slot2_screenplay":  
+    module = _load_stage_module("slot2_screenplay")  
+    research_path = stage_input.get("research_path")  
 
-    if stage == "slot1_research":
-        values = {
-            **common,
-            "output_path": str(output_dir / "research_output.json"),
-            "max_sources": int(os.getenv("CINEMA_MAX_RESEARCH_SOURCES", "12")),
-            "timeout_seconds": int(os.getenv("CINEMA_RESEARCH_REQUEST_TIMEOUT", "12")),
-        }
+    if not research_path:  
+        research_path = str(  
+            _locate_latest_artifact(  
+                [_stage_workspace(state, "slot1_research")]  
+            )  
+            or ""  
+        )  
 
-    elif stage == "slot2_screenplay":
-        if inputs["research"] is None:
-            raise StageExecutionError("Research output is required for screenplay.")
-        values = {
-            **common,
-            "research_path": str(inputs["research"]),
-            "research_output_path": str(inputs["research"]),
-            "output_path": str(output_dir / "screenplay_blueprint.json"),
-            "profile": profile_settings["screenplay_profile"],
-        }
+    if not research_path:  
+        raise StageExecutionError("No research artifact is available")  
 
-    elif stage == "slot4_audio":
-        if inputs["screenplay"] is None:
-            raise StageExecutionError("Screenplay output is required for audio.")
-        values = {
-            **common,
-            "screenplay_path": str(inputs["screenplay"]),
-            "output_dir": str(output_dir),
-            "timeline_path": str(output_dir / "audio_timeline.json"),
-            "voice": os.getenv("CINEMA_DEFAULT_VOICE", "default"),
-        }
+    kwargs = {  
+        **common,  
+        "research_path": research_path,  
+        "research_output_path": research_path,  
+        "output_dir": str(output_dir),  
+    }  
+    result = _invoke_stage_entrypoint(  
+        module,  
+        ("run_screenplay", "run", "create_screenplay", "execute"),  
+        kwargs,  
+    )  
 
-    elif stage == "slot3_visuals":
-        if inputs["screenplay"] is None or inputs["timeline"] is None:
-            raise StageExecutionError(
-                "Screenplay and audio timeline are required for visuals."
-            )
-        values = {
-            **common,
-            "screenplay_path": str(inputs["screenplay"]),
-            "timeline_path": str(inputs["timeline"]),
-            "output_dir": str(output_dir),
-            "device": os.getenv("CINEMA_DEVICE", "auto"),
-            "model_name": os.getenv("CINEMA_VISUAL_MODEL") or None,
-            "reference_image_path": os.getenv("CINEMA_REFERENCE_IMAGE") or None,
-            "batch_size": max(1, int(os.getenv("CINEMA_VISUAL_BATCH_SIZE", "1"))),
-            "seed": int(os.getenv("CINEMA_RANDOM_SEED", "42")),
-        }
+elif stage_name == "slot4_audio":  
+    module = _load_stage_module("slot4_audio")  
+    screenplay_path = stage_input.get("screenplay_path")  
 
-    elif stage == "slot5_editor":
-        if (
-            inputs["screenplay"] is None
-            or inputs["timeline"] is None
-            or inputs["visual_manifest"] is None
-        ):
-            raise StageExecutionError(
-                "Screenplay, audio timeline and visual manifest are required."
-            )
-        values = {
-            **common,
-            "screenplay_path": str(inputs["screenplay"]),
-            "timeline_path": str(inputs["timeline"]),
-            "visual_manifest_path": str(inputs["visual_manifest"]),
-            "output_path": str(output_dir / "final_video.mp4"),
-            "lut_path": os.getenv("CINEMA_LUT_PATH") or None,
-        }
+    if not screenplay_path:  
+        screenplay_path = str(  
+            _locate_latest_artifact(  
+                [_stage_workspace(state, "slot2_screenplay")]  
+            )  
+            or ""  
+        )  
 
-    else:
-        raise StageExecutionError(f"Unsupported production stage: {stage}")
+    if not screenplay_path:  
+        raise StageExecutionError("No screenplay artifact is available")  
 
-    try:
-        result = _invoke_supported(function, values)
-    except Exception as exc:
-        raise StageExecutionError(
-            f"{stage} failed: {type(exc).__name__}: {exc}"
-        ) from exc
+    kwargs = {  
+        **common,  
+        "screenplay_path": screenplay_path,  
+        "blueprint_path": screenplay_path,  
+        "output_dir": str(output_dir),  
+    }  
+    result = _invoke_stage_entrypoint(  
+        module,  
+        ("run_audio", "run", "generate_audio", "execute"),  
+        kwargs,  
+    )  
 
-    candidates: list[Path] = []
-    if isinstance(result, (str, Path)):
-        candidates.append(resolve_path(result))
-    elif isinstance(result, dict):
-        for key in (
-            "path", "output_path", "artifact_path", "video_path",
-            "timeline_path", "manifest_path",
-        ):
-            value = result.get(key)
-            if isinstance(value, (str, Path)):
-                candidates.append(resolve_path(value))
-        artifacts = result.get("artifacts")
-        if isinstance(artifacts, list):
-            candidates.extend(
-                resolve_path(item)
-                for item in artifacts
-                if isinstance(item, (str, Path))
-            )
-    elif isinstance(result, (list, tuple, set)):
-        candidates.extend(
-            resolve_path(item)
-            for item in result
-            if isinstance(item, (str, Path))
-        )
+elif stage_name == "slot3_visuals":  
+    module = _load_stage_module("slot3_visuals")  
+    screenplay_path = stage_input.get("screenplay_path")  
+    timeline_path = stage_input.get("timeline_path")  
 
-    # Include files written directly by the slot.
-    candidates.extend(_find_artifacts(state, stage))
+    if not screenplay_path:  
+        screenplay_path = str(  
+            _locate_latest_artifact(  
+                [_stage_workspace(state, "slot2_screenplay")]  
+            )  
+            or ""  
+        )  
 
-    unique: dict[str, Path] = {}
-    for path in candidates:
-        if path.exists() and path.is_file() and is_within(path, workspace):
-            unique[str(path.resolve())] = path.resolve()
+    if not timeline_path:  
+        timeline_path = str(  
+            _locate_latest_artifact(  
+                [_stage_workspace(state, "slot4_audio")]  
+            )  
+            or ""  
+        )  
 
-    if not unique:
-        raise StageExecutionError(
-            f"{stage} returned without creating a verifiable workspace artifact."
-        )
+    if not screenplay_path or not timeline_path:  
+        raise StageExecutionError(  
+            "Screenplay and audio timeline are required for visual generation"  
+        )  
 
-    return sorted(unique.values(), key=lambda item: item.stat().st_mtime)
+    kwargs = {  
+        **common,  
+        "screenplay_path": screenplay_path,  
+        "timeline_path": timeline_path,  
+        "output_dir": str(output_dir),  
+        "device": "cpu",  
+        "model_name": None,  
+        "reference_image_path": stage_input.get("reference_image_path"),  
+        "batch_size": 1,  
+        "seed": int(stage_input.get("seed", 42)),  
+    }  
+    result = _invoke_stage_entrypoint(  
+        module,  
+        ("run_visuals", "run", "generate_visuals", "execute"),  
+        kwargs,  
+    )  
 
+elif stage_name == "slot5_editor":  
+    module = _load_stage_module("slot5_editor")  
+    screenplay_path = stage_input.get("screenplay_path")  
+    timeline_path = stage_input.get("timeline_path")  
+    visual_manifest_path = stage_input.get("visual_manifest_path")  
 
-# ---------------------------------------------------------------------------
-# Stage execution and recovery
-# ---------------------------------------------------------------------------
+    if not screenplay_path:  
+        screenplay_path = str(  
+            _locate_latest_artifact(  
+                [_stage_workspace(state, "slot2_screenplay")]  
+            )  
+            or ""  
+        )  
+
+    if not timeline_path:  
+        timeline_path = str(  
+            _locate_latest_artifact(  
+                [_stage_workspace(state, "slot4_audio")]  
+            )  
+            or ""  
+        )  
+
+    if not visual_manifest_path:  
+        visual_manifest_path = str(  
+            _locate_latest_artifact(  
+                [_stage_workspace(state, "slot3_visuals")]  
+            )  
+            or ""  
+        )  
+
+    if not screenplay_path or not timeline_path or not visual_manifest_path:  
+        raise StageExecutionError(  
+            "Screenplay, audio timeline, and visual manifest are required for editing"  
+        )  
+
+    final_output = output_dir / "final_video.mp4"  
+    kwargs = {  
+        **common,  
+        "screenplay_path": screenplay_path,  
+        "timeline_path": timeline_path,  
+        "visual_manifest_path": visual_manifest_path,  
+        "output_path": str(final_output),  
+        "lut_path": stage_input.get("lut_path"),  
+    }  
+    result = _invoke_stage_entrypoint(  
+        module,  
+        ("run_editor", "run", "render_video", "execute"),  
+        kwargs,  
+    )  
+
+    if not final_output.is_file():  
+        returned_paths = _find_artifacts(result, [output_dir])  
+        videos = [path for path in returned_paths if path.suffix.lower() in {".mp4", ".mov", ".mkv"}]  
+        if videos:  
+            final_output = videos[0]  
+
+else:  
+    raise StageExecutionError(f"Unknown stage: {stage_name}")  
+
+artifacts = _find_artifacts(result, [output_dir])  
+
+if stage_name == "slot5_editor":  
+    videos = [  
+        path for path in artifacts  
+        if path.suffix.lower() in {".mp4", ".mov", ".mkv", ".webm"}  
+    ]  
+    if not videos:  
+        raise StageExecutionError(  
+            "Editor returned without producing a video artifact"  
+        )  
+
+return {  
+    "status": "completed",  
+    "outputs": _json_safe(result) if isinstance(result, dict) else {"result": _json_safe(result)},  
+    "artifacts": [str(path.resolve()) for path in artifacts],  
+    "test_mode": False,  
+}
+
+def _resolve_stage_inputs(
+state: dict[str, Any],
+stage_name: str,
+stage_input: dict[str, Any],
+) -> dict[str, Any]:
+"""Resolve known predecessor artifacts and preserve explicit caller inputs."""
+resolved = dict(stage_input)
+stage_workspace_roots = {
+stage: _stage_workspace(state, stage)
+for stage in STAGE_ORDER
+}
+
+if stage_name == "slot2_screenplay":  
+    resolved.setdefault(  
+        "research_path",  
+        str(_locate_latest_artifact([stage_workspace_roots["slot1_research"]]) or ""),  
+    )  
+
+elif stage_name == "slot4_audio":  
+    resolved.setdefault(  
+        "screenplay_path",  
+        str(_locate_latest_artifact([stage_workspace_roots["slot2_screenplay"]]) or ""),  
+    )  
+
+elif stage_name == "slot3_visuals":  
+    resolved.setdefault(  
+        "screenplay_path",  
+        str(_locate_latest_artifact([stage_workspace_roots["slot2_screenplay"]]) or ""),  
+    )  
+    resolved.setdefault(  
+        "timeline_path",  
+        str(_locate_latest_artifact([stage_workspace_roots["slot4_audio"]]) or ""),  
+    )  
+
+elif stage_name == "slot5_editor":  
+    resolved.setdefault(  
+        "screenplay_path",  
+        str(_locate_latest_artifact([stage_workspace_roots["slot2_screenplay"]]) or ""),  
+    )  
+    resolved.setdefault(  
+        "timeline_path",  
+        str(_locate_latest_artifact([stage_workspace_roots["slot4_audio"]]) or ""),  
+    )  
+    resolved.setdefault(  
+        "visual_manifest_path",  
+        str(_locate_latest_artifact([stage_workspace_roots["slot3_visuals"]]) or ""),  
+    )  
+
+return resolved
 
 def execute_stage(
-    job_id: str,
-    stage_name: str,
-    stage_input: dict[str, Any] | None = None,
-    test_mode: bool | None = None,
+job_id: str,
+stage_name: str,
+stage_input: dict[str, Any],
+test_mode: bool,
 ) -> dict[str, Any]:
-    """Execute one stage, validate outputs and persist its checkpoint."""
-    del stage_input  # Stage inputs are resolved from verified project artifacts.
+"""Execute one pipeline stage, verify output checksums, and persist its state."""
+if stage_name not in STAGE_ORDER:
+raise ValueError(
+f"Unknown stage '{stage_name}'. Valid stages: {', '.join(STAGE_ORDER)}"
+)
 
-    with _ACTIVE_JOBS_LOCK:
-        job = _ACTIVE_JOBS.get(job_id)
+with _ACTIVE_JOBS_LOCK:  
+    job = _ACTIVE_JOBS.get(job_id)  
 
-    if job is None or not job.get("state_path"):
-        raise PipelineError(f"Pipeline job is not registered: {job_id}")
+if job is None:  
+    raise PipelineError(f"Unknown or inactive job: {job_id}")  
 
-    state_path = resolve_path(job["state_path"])
-    state = load_project_state(state_path)
+state_path = Path(job["state_path"])  
+state = load_project_state(state_path)  
 
-    if stage_name not in state["stages"]:
-        raise PipelineError(f"Stage is not configured for this project: {stage_name}")
+if state["status"] in {"cancelled", "failed"}:  
+    raise PipelineError(  
+        f"Cannot execute stage for a {state['status']} project"  
+    )  
 
-    stage_record = state["stages"][stage_name]
-    stage_order = state["pipeline"]["stage_order"]
-    stage_index = stage_order.index(stage_name)
+stage_index = STAGE_ORDER.index(stage_name)  
+completed = state["pipeline"].get("completed_stages", [])  
 
-    if stage_index > 0:
-        previous = stage_order[stage_index - 1]
-        if state["stages"][previous]["status"] != "completed":
-            raise PipelineError(
-                f"Cannot run {stage_name} before {previous} completes."
-            )
+if stage_index > 0 and STAGE_ORDER[stage_index - 1] not in completed:  
+    raise PipelineError(  
+        f"Stage order violation: {stage_name} requires "  
+        f"{STAGE_ORDER[stage_index - 1]} to complete first"  
+    )  
 
-    if stage_record["status"] == "completed":
-        records = state.get("artifacts", {}).get(stage_name, [])
-        workspace = _project_workspace(state)
-        if records and all(_verify_artifact_record(item, workspace) for item in records):
-            return state
-        stage_record["status"] = "pending"
+_check_cancelled(job_id)  
+stage_input = _resolve_stage_inputs(state, stage_name, stage_input or {})  
+stage_record = state["stages"][stage_name]  
+stage_record["status"] = "running"  
+stage_record["attempts"] = int(stage_record.get("attempts", 0)) + 1  
+stage_record["started_at"] = utc_now()  
+stage_record["completed_at"] = None  
+stage_record["error"] = None  
+stage_record["input"] = _json_safe(stage_input)  
+state["status"] = "running"  
+state["pipeline"]["current_stage"] = stage_name  
+state["pipeline"]["failed_stage"] = None  
+save_project_state(state_path, state)  
 
-    _check_cancelled(job_id)
-    selected_test_mode = (
-        bool(state["project"]["test_mode"])
-        if test_mode is None
-        else bool(test_mode)
-    )
+start_time = time.monotonic()  
 
-    output_dir = _stage_workspace(state, stage_name)
-    start = time.monotonic()
+try:  
+    for key in (  
+        "research_path",  
+        "screenplay_path",  
+        "timeline_path",  
+        "visual_manifest_path",  
+    ):  
+        raw = stage_input.get(key)  
+        if raw:  
+            path = _resolve_path(raw)  
+            if not path.is_file():  
+                raise StageExecutionError(  
+                    f"Required input artifact does not exist: {key}={path}"  
+                )  
 
-    stage_record.update({
-        "status": "running",
-        "started_at": utc_now(),
-        "completed_at": None,
-        "duration_seconds": None,
-        "attempts": int(stage_record.get("attempts", 0)) + 1,
-        "error": None,
-    })
-    state["status"] = "running"
-    state["pipeline"]["current_stage"] = stage_name
-    state["pipeline"]["started_at"] = (
-        state["pipeline"].get("started_at") or utc_now()
-    )
-    save_project_state(state)
+    if test_mode:  
+        result = _run_test_stage(state, stage_name, stage_input)  
+    else:  
+        result = _run_production_stage(state, stage_name, stage_input)  
 
-    logger.info("Starting %s for %s", stage_name, job_id)
+    _check_cancelled(job_id)  
 
-    try:
-        timeout = max(
-            1,
-            int(os.getenv(
-                f"CINEMA_TIMEOUT_{stage_name.upper()}",
-                str(STAGE_TIMEOUT_SECONDS.get(stage_name, 600)),
-            )),
-        )
+    artifact_paths = []  
+    for raw_path in result.get("artifacts", []):  
+        path = _resolve_path(raw_path)  
+        if not path.is_file():  
+            raise StateIntegrityError(  
+                f"Stage reported a missing artifact: {path}"  
+            )  
+        artifact_paths.append(path)  
 
-        # Python cannot safely terminate a running slot thread. The timeout
-        # reports the overrun; slots should also implement their own I/O limits.
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(
-            _run_test_stage if selected_test_mode else _run_production_stage,
-            state,
-            stage_name,
-            output_dir,
-        )
-        try:
-            artifacts = future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError as exc:
-            future.cancel()
-            raise StageExecutionError(
-                f"{stage_name} exceeded its {timeout}-second timeout. "
-                "The running slot may need to reach its own cancellation point."
-            ) from exc
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+    if not artifact_paths:  
+        raise StageExecutionError(  
+            f"Stage {stage_name} completed without producing verifiable artifacts"  
+        )  
 
-        _check_cancelled(job_id)
+    artifact_records = []  
+    for artifact_path in artifact_paths:  
+        record = _artifact_record(artifact_path)  
+        _verify_artifact_record(record)  
+        artifact_records.append(record)  
 
-        workspace = _project_workspace(state)
-        records = [
-            _artifact_record(path, workspace)
-            for path in artifacts
-            if path.exists() and path.is_file()
-        ]
-        if not records:
-            raise StageExecutionError(f"{stage_name} produced no valid artifacts.")
+    stage_record["status"] = "completed"  
+    stage_record["completed_at"] = utc_now()  
+    stage_record["duration_seconds"] = round(time.monotonic() - start_time, 3)  
+    stage_record["outputs"] = _json_safe(result.get("outputs", {}))  
+    stage_record["artifacts"] = artifact_records  
+    stage_record["error"] = None  
 
-        stage_record.update({
-            "status": "completed",
-            "completed_at": utc_now(),
-            "duration_seconds": round(time.monotonic() - start, 3),
-            "artifacts": records,
-            "error": None,
-        })
-        state.setdefault("artifacts", {})[stage_name] = records
+    for index, artifact in enumerate(artifact_records):  
+        artifact_key = f"{stage_name}:{index + 1}"  
+        state["artifacts"][artifact_key] = artifact  
 
-        if stage_name not in state["pipeline"]["completed_stages"]:
-            state["pipeline"]["completed_stages"].append(stage_name)
+    completed = state["pipeline"].setdefault("completed_stages", [])  
+    if stage_name not in completed:  
+        completed.append(stage_name)  
 
-        state["pipeline"]["failed_stage"] = None
-        state["pipeline"]["last_error"] = None
-        save_project_state(state)
+    state["pipeline"]["completed_stages"] = [  
+        stage for stage in STAGE_ORDER if stage in completed  
+    ]  
+    state["pipeline"]["current_stage"] = None  
+    state["pipeline"]["last_error"] = None  
 
-        logger.info("Completed %s for %s", stage_name, job_id)
-        return state
+    save_project_state(state_path, state)  
 
-    except PipelineCancelled:
-        stage_record["status"] = "cancelled"
-        stage_record["completed_at"] = utc_now()
-        stage_record["duration_seconds"] = round(time.monotonic() - start, 3)
-        state["status"] = "cancelled"
-        state["pipeline"]["cancel_reason"] = "Cancellation requested."
-        save_project_state(state)
-        raise
+    LOGGER.info(  
+        "Job %s: %s completed in %.3fs (%d artifacts verified)",  
+        job_id,  
+        stage_name,  
+        stage_record["duration_seconds"],  
+        len(artifact_records),  
+    )  
 
-    except Exception as exc:
-        stage_record.update({
-            "status": "failed",
-            "completed_at": utc_now(),
-            "duration_seconds": round(time.monotonic() - start, 3),
-            "error": f"{type(exc).__name__}: {exc}",
-        })
-        state["status"] = "failed"
-        state["pipeline"]["failed_stage"] = stage_name
-        state["pipeline"]["last_error"] = stage_record["error"]
-        save_project_state(state)
-        raise
+    return {  
+        "job_id": job_id,  
+        "stage": stage_name,  
+        "status": "completed",  
+        "duration_seconds": stage_record["duration_seconds"],  
+        "artifacts": artifact_records,  
+        "outputs": stage_record["outputs"],  
+    }  
 
+except PipelineCancelled:  
+    state = load_project_state(state_path)  
+    stage_record = state["stages"][stage_name]  
+    stage_record["status"] = "cancelled"  
+    stage_record["completed_at"] = utc_now()  
+    stage_record["duration_seconds"] = round(time.monotonic() - start_time, 3)  
+    state["status"] = "cancelled"  
+    state["pipeline"]["current_stage"] = None  
+    save_project_state(state_path, state)  
+    raise  
+
+except Exception as exc:  
+    LOGGER.error(  
+        "Job %s stage %s failed: %s",  
+        job_id,  
+        stage_name,  
+        exc,  
+    )  
+    LOGGER.debug("%s", traceback.format_exc())  
+
+    state = load_project_state(state_path)  
+    stage_record = state["stages"][stage_name]  
+    stage_record["status"] = "failed"  
+    stage_record["completed_at"] = utc_now()  
+    stage_record["duration_seconds"] = round(time.monotonic() - start_time, 3)  
+    stage_record["error"] = {  
+        "type": type(exc).__name__,  
+        "message": str(exc),  
+        "timestamp": utc_now(),  
+    }  
+    state["status"] = "failed"  
+    state["pipeline"]["current_stage"] = None  
+    state["pipeline"]["failed_stage"] = stage_name  
+    state["pipeline"]["last_error"] = stage_record["error"]  
+    save_project_state(state_path, state)  
+
+    if isinstance(exc, PipelineError):  
+        raise  
+
+    raise StageExecutionError(  
+        f"Stage {stage_name} failed: {exc}"  
+    ) from exc
+
+def _create_test_video(
+state: dict[str, Any],
+output_path: Path,
+duration_seconds: float = 2.0,
+) -> dict[str, Any]:
+"""Create and validate a short FFmpeg test video without GPU dependencies."""
+output_path.parent.mkdir(parents=True, exist_ok=True)
+output_path = _assert_within(
+output_path,
+_project_workspace(state),
+"Test video output",
+)
+
+ffmpeg = shutil.which("ffmpeg")  
+ffprobe = shutil.which("ffprobe")  
+
+if not ffmpeg or not ffprobe:  
+    raise PipelineError(  
+        "Test-mode video validation requires both ffmpeg and ffprobe "  
+        "to be installed and available on PATH"  
+    )  
+
+duration_seconds = max(1.0, min(float(duration_seconds), 2.0))  
+
+command = [  
+    ffmpeg,  
+    "-hide_banner",  
+    "-loglevel", "error",  
+    "-y",  
+    "-f", "lavfi",  
+    "-i", "testsrc=size=320x240:rate=24",  
+    "-f", "lavfi",  
+    "-i", "sine=frequency=440:sample_rate=44100",  
+    "-t", f"{duration_seconds:.3f}",  
+    "-c:v", "libx264",  
+    "-preset", "ultrafast",  
+    "-pix_fmt", "yuv420p",  
+    "-c:a", "aac",  
+    "-b:a", "64k",  
+    "-movflags", "+faststart",  
+    str(output_path),  
+]  
+
+try:  
+    subprocess.run(  
+        command,  
+        check=True,  
+        capture_output=True,  
+        text=True,  
+        timeout=45,  
+        shell=False,  
+    )  
+except subprocess.TimeoutExpired as exc:  
+    raise PipelineError("FFmpeg test-video generation timed out") from exc  
+except subprocess.CalledProcessError as exc:  
+    raise PipelineError(  
+        "FFmpeg test-video generation failed: "  
+        f"{(exc.stderr or exc.stdout or '').strip()}"  
+    ) from exc  
+
+if not output_path.is_file() or output_path.stat().st_size <= 0:  
+    raise StateIntegrityError("FFmpeg did not produce a non-empty test video")  
+
+probe_command = [  
+    ffprobe,  
+    "-v", "error",  
+    "-show_entries", "format=duration,size:stream=codec_type",  
+    "-of", "json",  
+    str(output_path),  
+]  
+
+try:  
+    probe = subprocess.run(  
+        probe_command,  
+        check=True,  
+        capture_output=True,  
+        text=True,  
+        timeout=15,  
+        shell=False,  
+    )  
+    metadata = json.loads(probe.stdout)  
+except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:  
+    raise StateIntegrityError(f"ffprobe could not validate test video: {exc}") from exc  
+
+format_info = metadata.get("format", {})  
+streams = metadata.get("streams", [])  
+actual_duration = float(format_info.get("duration", 0))  
+
+if actual_duration <= 0:  
+    raise StateIntegrityError("Test video has invalid duration")  
+
+stream_types = {  
+    stream.get("codec_type")  
+    for stream in streams  
+    if isinstance(stream, dict)  
+}  
+
+if "video" not in stream_types:  
+    raise StateIntegrityError("Test export contains no video stream")  
+
+if "audio" not in stream_types:  
+    raise StateIntegrityError("Test export contains no audio stream")  
+
+if abs(actual_duration - duration_seconds) > 0.75:  
+    raise StateIntegrityError(  
+        f"Test video duration mismatch: expected about {duration_seconds}s, "  
+        f"got {actual_duration:.3f}s"  
+    )  
+
+artifact = _artifact_record(output_path, "video")  
+_verify_artifact_record(artifact)  
+
+return {  
+    "path": str(output_path.resolve()),  
+    "duration_seconds": actual_duration,  
+    "size_bytes": output_path.stat().st_size,  
+    "sha256": artifact["sha256"],  
+    "streams": sorted(stream_types),  
+    "validated_at": utc_now(),  
+}
+
+def _finalize_test_export(
+state: dict[str, Any],
+job_id: str,
+) -> dict[str, Any]:
+"""Create the final lightweight end-to-end test video after all stages pass."""
+workspace = _project_workspace(state)
+editor_workspace = _stage_workspace(state, "slot5_editor")
+editor_workspace.mkdir(parents=True, exist_ok=True)
+
+output_path = editor_workspace / "final_video.mp4"  
+result = _create_test_video(state, output_path, duration_seconds=2.0)  
+
+state = load_project_state(_get_state_path(state))  
+state["artifacts"]["final_video"] = {  
+    "path": result["path"],  
+    "sha256": result["sha256"],  
+    "size_bytes": result["size_bytes"],  
+    "kind": "video",  
+    "duration_seconds": result["duration_seconds"],  
+    "verified_at": result["validated_at"],  
+}  
+
+editor_record = state["stages"]["slot5_editor"]  
+editor_record["outputs"]["final_video"] = result["path"]  
+editor_record["outputs"]["video_validation"] = result  
+editor_record["artifacts"] = [  
+    artifact  
+    for artifact in editor_record.get("artifacts", [])  
+    if artifact.get("path") != result["path"]  
+]  
+editor_record["artifacts"].append(  
+    _artifact_record(output_path, "video")  
+)  
+
+save_project_state(_get_state_path(state), state)  
+return result
 
 def recover_project(
-    state_path: str | Path,
-    test_mode: bool | None = None,
+state_path: str | Path,
+test_mode: bool,
 ) -> dict[str, Any]:
-    """Invalidate corrupted checkpoints and preserve valid completed stages."""
-    del test_mode
-    state = load_project_state(state_path)
-    workspace = _project_workspace(state)
-    invalidated: list[str] = []
-    invalidate_following = False
+"""Recover a project from persisted stage state and verify completed artifacts."""
+path = _resolve_path(state_path)
+state = load_project_state(path)
 
-    for stage in state["pipeline"]["stage_order"]:
-        record = state["stages"][stage]
-        artifact_records = state.get("artifacts", {}).get(stage, [])
-        valid = (
-            record.get("status") == "completed"
-            and bool(artifact_records)
-            and all(_verify_artifact_record(item, workspace) for item in artifact_records)
-        )
+actions: list[dict[str, Any]] = []  
+completed = state["pipeline"].get("completed_stages", [])  
 
-        if invalidate_following or (record.get("status") == "completed" and not valid):
-            invalidate_following = True
-            record.update(_default_stage_record())
-            state.get("artifacts", {}).pop(stage, None)
-            invalidated.append(stage)
+verified_stages = []  
+invalid_stages = []  
 
-    completed = []
-    for stage in state["pipeline"]["stage_order"]:
-        if state["stages"][stage]["status"] != "completed":
-            break
-        completed.append(stage)
+for stage_name in STAGE_ORDER:  
+    record = state["stages"][stage_name]  
+    status = record.get("status")  
 
-    state["pipeline"]["completed_stages"] = completed
-    state["pipeline"]["current_stage"] = None
-    state["pipeline"]["failed_stage"] = None
-    state["pipeline"]["last_error"] = None
-    state["status"] = "created" if not completed else "running"
-    state["recovery"] = {
-        "recovered_at": utc_now(),
-        "invalidated_stages": invalidated,
-    }
-    save_project_state(state)
-    _register_job(state["project_id"], resolve_path(state["state_path"]))
-    return state
+    if status == "completed":  
+        artifacts = record.get("artifacts", [])  
+        try:  
+            if not artifacts:  
+                raise StateIntegrityError(  
+                    f"Completed stage {stage_name} has no artifact records"  
+                )  
 
+            for artifact in artifacts:  
+                _verify_artifact_record(artifact)  
 
-# ---------------------------------------------------------------------------
-# Pipeline lifecycle and status API
-# ---------------------------------------------------------------------------
+            verified_stages.append(stage_name)  
+            actions.append({  
+                "action": "verified",  
+                "stage": stage_name,  
+                "timestamp": utc_now(),  
+            })  
 
-def run_pipeline(job_id: str, test_mode: bool = False) -> dict[str, Any]:
-    """Run all configured stages in their declared dependency order."""
-    with _ACTIVE_JOBS_LOCK:
-        job = _ACTIVE_JOBS.get(job_id)
+        except StateIntegrityError as exc:  
+            invalid_stages.append(stage_name)  
+            actions.append({  
+                "action": "invalidated",  
+                "stage": stage_name,  
+                "reason": str(exc),  
+                "timestamp": utc_now(),  
+            })  
 
-    if job is None or not job.get("state_path"):
-        raise PipelineError(f"Pipeline job is not registered: {job_id}")
+    elif status == "running":  
+        record["status"] = "interrupted"  
+        record["error"] = {  
+            "type": "InterruptedExecution",  
+            "message": "The process stopped before this stage was committed.",  
+            "timestamp": utc_now(),  
+        }  
+        actions.append({  
+            "action": "marked_interrupted",  
+            "stage": stage_name,  
+            "timestamp": utc_now(),  
+        })  
 
-    state_path = resolve_path(job["state_path"])
-    state = load_project_state(state_path)
-    _register_job(job_id, state_path)
+if invalid_stages:  
+    first_invalid_index = min(STAGE_ORDER.index(stage) for stage in invalid_stages)  
+    for stage_name in STAGE_ORDER[first_invalid_index:]:  
+        record = state["stages"][stage_name]  
+        if record.get("status") == "completed":  
+            record["status"] = "pending"  
+            record["completed_at"] = None  
+            record["artifacts"] = []  
+            record["outputs"] = {}  
+            actions.append({  
+                "action": "reset_stage",  
+                "stage": stage_name,  
+                "timestamp": utc_now(),  
+            })  
 
-    event = _cancel_event(job_id)
-    if event.is_set():
-        raise PipelineCancelled(f"Pipeline was cancelled before starting: {job_id}")
+    verified_stages = [  
+        stage for stage in verified_stages  
+        if STAGE_ORDER.index(stage) < first_invalid_index  
+    ]  
 
-    started = time.monotonic()
-    state["project"]["test_mode"] = bool(test_mode)
-    state["status"] = "running"
-    state["pipeline"]["started_at"] = state["pipeline"].get("started_at") or utc_now()
-    state["pipeline"]["completed_at"] = None
-    state["pipeline"]["last_error"] = None
-    save_project_state(state)
+if state["status"] == "running":  
+    state["status"] = "recoverable"  
 
-    try:
-        state = recover_project(state_path, test_mode)
-        state["status"] = "running"
-        state["project"]["test_mode"] = bool(test_mode)
-        save_project_state(state)
+state["pipeline"]["completed_stages"] = [  
+    stage for stage in STAGE_ORDER if stage in verified_stages  
+]  
+state["pipeline"]["current_stage"] = None  
 
-        for stage in state["pipeline"]["stage_order"]:
-            _check_cancelled(job_id)
-            state = load_project_state(state_path)
-            if state["stages"][stage]["status"] == "completed":
-                continue
-            execute_stage(job_id, stage, test_mode=test_mode)
+state["recovery"] = {  
+    "recovered_at": utc_now(),  
+    "test_mode": bool(test_mode),  
+    "actions": actions,  
+}  
 
-        _check_cancelled(job_id)
-        state = load_project_state(state_path)
+if test_mode:  
+    state["test_mode"] = True  
 
-        if test_mode:
-            video_path = _create_test_video(state)
-            record = _artifact_record(video_path, _project_workspace(state))
-            state.setdefault("artifacts", {}).setdefault("slot5_editor", []).append(record)
-            state["stages"]["slot5_editor"]["artifacts"].append(record)
+save_project_state(path, state)  
 
-        state["status"] = "completed"
-        state["pipeline"]["current_stage"] = None
-        state["pipeline"]["completed_at"] = utc_now()
-        state["pipeline"]["duration_seconds"] = round(time.monotonic() - started, 3)
-        state["pipeline"]["last_error"] = None
-        save_project_state(state)
+return {  
+    "project_id": state["project_id"],  
+    "state_path": str(path),  
+    "status": state["status"],  
+    "verified_stages": verified_stages,  
+    "invalid_stages": invalid_stages,  
+    "actions": actions,  
+    "next_stage": next(  
+        (  
+            stage for stage in STAGE_ORDER  
+            if stage not in state["pipeline"]["completed_stages"]  
+        ),  
+        None,  
+    ),  
+}
 
-        return {
-            "job_id": job_id,
-            "project_id": state["project_id"],
-            "status": "completed",
-            "progress": 100.0,
-            "state_path": str(state_path),
-            "artifacts": [
-                record["path"]
-                for records in state.get("artifacts", {}).values()
-                for record in records
-            ],
-        }
+def run_pipeline(
+job_id: str,
+test_mode: bool,
+) -> dict[str, Any]:
+"""Run all pipeline stages in strict order and persist every transition."""
+with _ACTIVE_JOBS_LOCK:
+job = _ACTIVE_JOBS.get(job_id)
 
-    except PipelineCancelled:
-        state = load_project_state(state_path)
-        state["status"] = "cancelled"
-        state["pipeline"]["current_stage"] = None
-        state["pipeline"]["completed_at"] = utc_now()
-        state["pipeline"]["duration_seconds"] = round(time.monotonic() - started, 3)
-        state["pipeline"]["cancel_reason"] = state["pipeline"].get(
-            "cancel_reason", "Cancellation requested."
-        )
-        save_project_state(state)
-        return {
-            "job_id": job_id,
-            "project_id": state["project_id"],
-            "status": "cancelled",
-            "progress": _progress(state),
-            "state_path": str(state_path),
-        }
+if job is None:  
+    raise PipelineError(f"Unknown job: {job_id}")  
 
-    except Exception as exc:
-        logger.exception("Pipeline failed for %s", job_id)
-        state = load_project_state(state_path)
-        state["status"] = "failed"
-        state["pipeline"]["completed_at"] = utc_now()
-        state["pipeline"]["duration_seconds"] = round(time.monotonic() - started, 3)
-        state["pipeline"]["last_error"] = f"{type(exc).__name__}: {exc}"
-        save_project_state(state)
-        return {
-            "job_id": job_id,
-            "project_id": state["project_id"],
-            "status": "failed",
-            "progress": _progress(state),
-            "error": state["pipeline"]["last_error"],
-            "state_path": str(state_path),
-        }
+state_path = Path(job["state_path"])  
+state = load_project_state(state_path)  
 
+with _ACTIVE_JOBS_LOCK:  
+    job["status"] = "running"  
+    job["started_at"] = utc_now()  
+    job["test_mode"] = bool(test_mode)  
 
-def _progress(state: dict[str, Any]) -> float:
-    """Calculate progress from the configured stage count."""
-    stages = state["pipeline"]["stage_order"]
-    if not stages:
-        return 0.0
-    completed = sum(
-        1 for stage in stages
-        if state["stages"].get(stage, {}).get("status") == "completed"
-    )
-    return round(100.0 * completed / len(stages), 2)
+state["test_mode"] = bool(test_mode)  
+state["status"] = "running"  
+state["pipeline"]["started_at"] = utc_now()  
+state["pipeline"]["completed_at"] = None  
+state["pipeline"]["cancel_reason"] = None  
+save_project_state(state_path, state)  
 
+pipeline_start = time.monotonic()  
+
+try:  
+    if test_mode:  
+        # Keep the CI path fully offline: no model downloads, GPU calls, or API requests.  
+        # FFmpeg is used only for the final short test export.  
+        for stage_name in STAGE_ORDER:  
+            _check_cancelled(job_id)  
+            state = load_project_state(state_path)  
+
+            if stage_name in state["pipeline"].get("completed_stages", []):  
+                for artifact in state["stages"][stage_name].get("artifacts", []):  
+                    _verify_artifact_record(artifact)  
+                continue  
+
+            stage_input = _resolve_stage_inputs(state, stage_name, {})  
+            execute_stage(job_id, stage_name, stage_input, test_mode=True)  
+
+        _check_cancelled(job_id)  
+        final_video = _finalize_test_export(state, job_id)  
+
+    else:  
+        for stage_name in STAGE_ORDER:  
+            _check_cancelled(job_id)  
+            state = load_project_state(state_path)  
+
+            if stage_name in state["pipeline"].get("completed_stages", []):  
+                for artifact in state["stages"][stage_name].get("artifacts", []):  
+                    _verify_artifact_record(artifact)  
+                continue  
+
+            stage_input = _resolve_stage_inputs(state, stage_name, {})  
+            execute_stage(job_id, stage_name, stage_input, test_mode=False)  
+
+        state = load_project_state(state_path)  
+        final_artifact = state.get("artifacts", {}).get("final_video")  
+
+        if final_artifact:  
+            _verify_artifact_record(final_artifact)  
+            final_video = {  
+                "path": final_artifact["path"],  
+                "duration_seconds": final_artifact.get("duration_seconds"),  
+                "size_bytes": final_artifact.get("size_bytes"),  
+                "sha256": final_artifact.get("sha256"),  
+            }  
+        else:  
+            editor_record = state["stages"]["slot5_editor"]  
+            candidates = [  
+                artifact for artifact in editor_record.get("artifacts", [])  
+                if Path(artifact.get("path", "")).suffix.lower()  
+                in {".mp4", ".mov", ".mkv", ".webm"}  
+            ]  
+            if not candidates:  
+                raise StateIntegrityError(  
+                    "Pipeline stages completed, but the final video artifact "  
+                    "is missing from the editor manifest"  
+                )  
+
+            final_artifact = candidates[0]  
+            _verify_artifact_record(final_artifact)  
+            state["artifacts"]["final_video"] = final_artifact  
+            save_project_state(state_path, state)  
+            final_video = {  
+                "path": final_artifact["path"],  
+                "duration_seconds": final_artifact.get("duration_seconds"),  
+                "size_bytes": final_artifact.get("size_bytes"),  
+                "sha256": final_artifact.get("sha256"),  
+            }  
+
+    _check_cancelled(job_id)  
+
+    state = load_project_state(state_path)  
+    state["status"] = "completed"  
+    state["pipeline"]["current_stage"] = None  
+    state["pipeline"]["failed_stage"] = None  
+    state["pipeline"]["last_error"] = None  
+    state["pipeline"]["completed_at"] = utc_now()  
+    state["pipeline"]["duration_seconds"] = round(  
+        time.monotonic() - pipeline_start, 3  
+    )  
+    state["integrity"]["last_verified_at"] = utc_now()  
+    save_project_state(state_path, state)  
+
+    with _ACTIVE_JOBS_LOCK:  
+        job["status"] = "completed"  
+        job["completed_at"] = utc_now()  
+        job["duration_seconds"] = state["pipeline"]["duration_seconds"]  
+        job["final_video"] = final_video  
+
+    LOGGER.info(  
+        "Pipeline %s completed in %.3fs",  
+        job_id,  
+        state["pipeline"]["duration_seconds"],  
+    )  
+
+    return {  
+        "job_id": job_id,  
+        "project_id": state["project_id"],  
+        "status": "completed",  
+        "test_mode": bool(test_mode),  
+        "duration_seconds": state["pipeline"]["duration_seconds"],  
+        "completed_stages": list(STAGE_ORDER),  
+        "final_video": final_video,  
+        "state_path": str(state_path.resolve()),  
+    }  
+
+except PipelineCancelled as exc:  
+    state = load_project_state(state_path)  
+    state["status"] = "cancelled"  
+    state["pipeline"]["current_stage"] = None  
+    state["pipeline"]["cancel_reason"] = str(exc)  
+    state["pipeline"]["completed_at"] = utc_now()  
+    state["pipeline"]["duration_seconds"] = round(  
+        time.monotonic() - pipeline_start, 3  
+    )  
+    save_project_state(state_path, state)  
+
+    with _ACTIVE_JOBS_LOCK:  
+        job["status"] = "cancelled"  
+        job["error"] = str(exc)  
+        job["completed_at"] = utc_now()  
+
+    raise  
+
+except Exception as exc:  
+    LOGGER.error("Pipeline %s failed: %s", job_id, exc)  
+    LOGGER.debug("%s", traceback.format_exc())  
+
+    state = load_project_state(state_path)  
+    state["status"] = "failed"  
+    state["pipeline"]["current_stage"] = None  
+    state["pipeline"]["completed_at"] = utc_now()  
+    state["pipeline"]["duration_seconds"] = round(  
+        time.monotonic() - pipeline_start, 3  
+    )  
+    state["pipeline"]["last_error"] = {  
+        "type": type(exc).__name__,  
+        "message": str(exc),  
+        "timestamp": utc_now(),  
+    }  
+    save_project_state(state_path, state)  
+
+    with _ACTIVE_JOBS_LOCK:  
+        job["status"] = "failed"  
+        job["error"] = str(exc)  
+        job["completed_at"] = utc_now()  
+
+    raise
+
+def cancel_pipeline(job_id: str, reason: str) -> dict[str, Any]:
+"""Request cooperative cancellation of an active pipeline."""
+reason = str(reason or "Cancelled by caller").strip()
+
+with _ACTIVE_JOBS_LOCK:  
+    job = _ACTIVE_JOBS.get(job_id)  
+
+if job is None:  
+    raise PipelineError(f"Unknown job: {job_id}")  
+
+if job.get("status") in {"completed", "failed", "cancelled"}:  
+    return get_pipeline_status(job_id)  
+
+event = _cancel_event(job_id)  
+event.set()  
+
+with _ACTIVE_JOBS_LOCK:  
+    job["cancel_reason"] = reason  
+    job["cancel_requested_at"] = utc_now()  
+    job["status"] = "cancellation_requested"  
+
+state_path = Path(job["state_path"])  
+state = load_project_state(state_path)  
+state["pipeline"]["cancel_reason"] = reason  
+state["pipeline"]["cancel_requested_at"] = utc_now()  
+save_project_state(state_path, state)  
+
+return get_pipeline_status(job_id)
 
 def get_pipeline_status(job_id: str) -> dict[str, Any]:
-    """Return the API-compatible pipeline status for a registered job."""
-    with _ACTIVE_JOBS_LOCK:
-        job = _ACTIVE_JOBS.get(job_id)
+"""Return the current in-memory job status and persisted project progress."""
+with _ACTIVE_JOBS_LOCK:
+job = _ACTIVE_JOBS.get(job_id)
 
-    if job is None or not job.get("state_path"):
-        return {
-            "job_id": job_id,
-            "status": "failed",
-            "progress": 0.0,
-            "error": "Pipeline job is not registered in this process.",
-        }
+if job is None:  
+    raise PipelineError(f"Unknown job: {job_id}")  
 
-    try:
-        state = load_project_state(job["state_path"])
-    except Exception as exc:
-        return {
-            "job_id": job_id,
-            "status": "failed",
-            "progress": 0.0,
-            "error": f"Unable to load project state: {exc}",
-        }
+state_path = Path(job["state_path"])  
+state = load_project_state(state_path)  
 
-    stage_order = state["pipeline"]["stage_order"]
-    current_stage = state["pipeline"].get("current_stage")
-    if not current_stage:
-        current_stage = next(
-            (
-                stage for stage in stage_order
-                if state["stages"].get(stage, {}).get("status") in {"running", "failed"}
-            ),
-            None,
-        )
+return {  
+    "job_id": job_id,  
+    "project_id": state["project_id"],  
+    "status": job.get("status", state.get("status")),  
+    "current_stage": state["pipeline"].get("current_stage"),  
+    "completed_stages": list(state["pipeline"].get("completed_stages", [])),  
+    "stage_statuses": {  
+        stage: state["stages"][stage].get("status", "pending")  
+        for stage in STAGE_ORDER  
+    },  
+    "failed_stage": state["pipeline"].get("failed_stage"),  
+    "cancel_reason": job.get("cancel_reason")  
+    or state["pipeline"].get("cancel_reason"),  
+    "error": job.get("error")  
+    or state["pipeline"].get("last_error"),  
+    "state_path": str(state_path.resolve()),  
+    "updated_at": state.get("updated_at"),  
+    "test_mode": state.get("test_mode", False),  
+}
 
-    statuses = {
-        name: record.get("status", "pending")
-        for name, record in state["stages"].items()
-    }
+def _setup_logging(verbose: bool = False) -> None:
+"""Configure concise console logging."""
+logging.basicConfig(
+level=logging.DEBUG if verbose else logging.INFO,
+format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+datefmt="%H:%M:%S",
+)
 
-    return {
-        "job_id": job_id,
-        "project_id": state["project_id"],
-        "status": state["status"],
-        "current_stage": current_stage,
-        "stage": current_stage,
-        "progress": 100.0 if state["status"] == "completed" else _progress(state),
-        "completed_stages": list(state["pipeline"].get("completed_stages", [])),
-        "stage_statuses": statuses,
-        "failed_stage": state["pipeline"].get("failed_stage"),
-        "cancel_reason": state["pipeline"].get("cancel_reason"),
-        "error": state["pipeline"].get("last_error"),
-        "message": state["pipeline"].get("last_error"),
-        "state_path": str(state["state_path"]),
-        "workspace_dir": state["project"]["workspace_dir"],
-        "updated_at": state.get("updated_at"),
-        "test_mode": bool(state["project"].get("test_mode", False)),
-        "artifacts": state.get("artifacts", {}),
-    }
+def _register_signal_handlers(job_id: str) -> None:
+"""Connect supported process signals to cooperative pipeline cancellation."""
+def handler(signum, _frame):
+try:
+cancel_pipeline(job_id, f"Received signal {signum}")
+except Exception:
+LOGGER.exception("Unable to request cancellation after signal %s", signum)
 
+for signum in (signal.SIGINT, signal.SIGTERM):  
+    try:  
+        signal.signal(signum, handler)  
+    except (ValueError, OSError):  
+        # Signal handlers can only be installed from the main thread.  
+        pass
 
-def cancel_pipeline(
-    job_id: str,
-    reason: str = "Cancellation requested.",
-) -> dict[str, Any]:
-    """Request cooperative cancellation for a pipeline job."""
-    with _ACTIVE_JOBS_LOCK:
-        job = _ACTIVE_JOBS.get(job_id)
+def _build_parser() -> argparse.ArgumentParser:
+"""Build the command-line interface."""
+parser = argparse.ArgumentParser(
+description="Run the Autonomous AI Cinema Studio Engine pipeline."
+)
+parser.add_argument(
+"--topic",
+required=True,
+help="Topic or subject for the cinematic project.",
+)
+parser.add_argument(
+"--language",
+default="Hindi",
+help="Narration and screenplay language (default: Hindi).",
+)
+parser.add_argument(
+"--profile",
+required=True,
+choices=sorted(PROFILE_DEFAULTS.keys()),
+help="Video profile: reel or documentary.",
+)
+parser.add_argument(
+"--output-root",
+default=str(DEFAULT_OUTPUT_ROOT),
+help="Root directory for project outputs.",
+)
+parser.add_argument(
+"--test-mode",
+action="store_true",
+help="Run offline CI pipeline and generate a short FFmpeg test video.",
+)
+parser.add_argument(
+"--verbose",
+action="store_true",
+help="Enable debug logging.",
+)
+return parser
 
-    if job is None or not job.get("state_path"):
-        raise PipelineError(f"Pipeline job is not registered: {job_id}")
+def main(argv: list[str] | None = None) -> int:
+"""CLI entrypoint."""
+parser = _build_parser()
+args = parser.parse_args(argv)
+_setup_logging(args.verbose)
 
-    state_path = resolve_path(job["state_path"])
-    state = load_project_state(state_path)
+try:  
+    state = create_project(  
+        topic=args.topic,  
+        language=args.language,  
+        profile=args.profile,  
+        output_root=args.output_root,  
+        test_mode=args.test_mode,  
+    )  
 
-    if state["status"] in TERMINAL_STATES:
-        return get_pipeline_status(job_id)
+    job_id = state["project_id"]  
+    state_path = state["state_path"]  
 
-    _cancel_event(job_id).set()
-    state["status"] = "cancelling"
-    state["pipeline"]["cancel_reason"] = str(reason)
-    save_project_state(state)
+    with _ACTIVE_JOBS_LOCK:  
+        _ACTIVE_JOBS[job_id] = {  
+            "job_id": job_id,  
+            "state_path": state_path,  
+            "status": "created",  
+            "created_at": utc_now(),  
+            "test_mode": bool(args.test_mode),  
+        }  
 
-    return get_pipeline_status(job_id)
+    _cancel_event(job_id)  
+    _register_signal_handlers(job_id)  
 
+    LOGGER.info("Starting project %s", job_id)  
+    LOGGER.info("State file: %s", state_path)  
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+    result = run_pipeline(job_id, test_mode=args.test_mode)  
 
-def main() -> int:
-    """Run the pipeline from the command line."""
-    import argparse
+    print(json.dumps(result, ensure_ascii=False, indent=2))  
+    return 0  
 
-    parser = argparse.ArgumentParser(description="Autonomous AI Cinema Studio Engine")
-    parser.add_argument("--topic", required=True)
-    parser.add_argument("--language", default="Hindi")
-    parser.add_argument("--profile", choices=sorted(PROFILES), default="reel")
-    parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
-    parser.add_argument("--test-mode", action="store_true")
-    args = parser.parse_args()
+except KeyboardInterrupt:  
+    LOGGER.error("Interrupted by user")  
+    return 130  
 
-    state = create_project(
-        topic=args.topic,
-        language=args.language,
-        profile=args.profile,
-        output_root=args.output_root,
-        test_mode=args.test_mode,
-    )
-    result = run_pipeline(state["project_id"], args.test_mode)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if result.get("status") == "completed" else 1
+except Exception as exc:  
+    LOGGER.error("Pipeline failed: %s", exc)  
+    if args.verbose:  
+        traceback.print_exc()  
+    return 1
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+if name == "main":
+raise SystemExit(main())
