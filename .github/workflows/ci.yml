@@ -1,0 +1,303 @@
+# File: .github/workflows/ci.yml
+# Type: GitHub Actions Workflow
+# Purpose: CPU-only CI validation and end-to-end test rendering.
+
+name: Cinema Studio CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cinema-studio-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-and-test:
+    name: Validate Architecture and Run CPU Test Pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      CUDA_VISIBLE_DEVICES: "-1"
+      CINEMA_CI: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg \
+            git \
+            ca-certificates
+          ffmpeg -version
+          ffprobe -version
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Upgrade pip tooling
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip setuptools wheel
+
+      - name: Install project dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install -r requirements.txt
+          python -m pip check
+
+      - name: Verify Python and CPU-only environment
+        run: |
+          set -euo pipefail
+          python --version
+          python -m pip --version
+          python -c "import torch; print('PyTorch:', torch.__version__); print('CUDA available:', torch.cuda.is_available()); assert not torch.cuda.is_available(), 'CI must run without CUDA.'"
+
+      - name: Verify required project files
+        run: |
+          set -euo pipefail
+
+          required_files=(
+            "ARCHITECTURE.md"
+            "config.py"
+            "schemas.py"
+            "slot1_research.py"
+            "slot2_screenplay.py"
+            "slot4_audio.py"
+            "slot3_visuals.py"
+            "slot5_editor.py"
+            "master_pipeline.py"
+            "server.py"
+            "requirements.txt"
+          )
+
+          for file in "${required_files[@]}"; do
+            if [[ ! -f "$file" ]]; then
+              echo "::error::Required project file is missing: $file"
+              exit 1
+            fi
+            echo "Verified file: $file"
+          done
+
+      - name: Verify isolated workspace directories
+        run: |
+          set -euo pipefail
+
+          required_dirs=(
+            "workspace/01_research_vault"
+            "workspace/02_screenplay_desk"
+            "workspace/03_audio_studio"
+            "workspace/04_visual_lab"
+            "workspace/05_master_theater"
+          )
+
+          for directory in "${required_dirs[@]}"; do
+            if [[ ! -d "$directory" ]]; then
+              echo "::error::Required workspace directory is missing: $directory"
+              exit 1
+            fi
+            echo "Verified workspace: $directory"
+          done
+
+      - name: Validate imports and API application
+        run: |
+          set -euo pipefail
+
+          python -c "import fastapi, pydantic, uvicorn, websockets; print('API dependencies imported successfully.')"
+          python -c "import server; assert server.app is not None; print('FastAPI application imported successfully.')"
+          python -c "import master_pipeline; print('Master pipeline module imported successfully.')"
+
+      - name: Run unit tests
+        run: |
+          set -euo pipefail
+
+          if [[ -d tests ]]; then
+            python -m pytest -q tests
+          else
+            echo "::error::The tests/ directory is missing."
+            exit 1
+          fi
+
+      - name: Run end-to-end CPU test pipeline
+        run: |
+          set -euo pipefail
+
+          mkdir -p workspace/05_master_theater/ci-artifacts
+
+          python master_pipeline.py \
+            --topic "मरकुस 4:35-41" \
+            --profile reel \
+            --test-mode
+
+      - name: Verify final test render
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          root = Path.cwd()
+          output_root = root / "workspace" / "05_master_theater"
+
+          ignored_dirs = {
+              ".git",
+              "__pycache__",
+              "api_jobs",
+              "ci-artifacts",
+          }
+
+          video_extensions = {".mp4", ".mov", ".mkv", ".webm"}
+
+          candidates = []
+
+          for path in output_root.rglob("*"):
+              if not path.is_file():
+                  continue
+
+              if path.suffix.lower() not in video_extensions:
+                  continue
+
+              if any(part in ignored_dirs for part in path.parts):
+                  continue
+
+              candidates.append(path)
+
+          if not candidates:
+              print(
+                  "::error::No final video render was found under "
+                  "workspace/05_master_theater."
+              )
+              sys.exit(1)
+
+          candidates.sort(
+              key=lambda path: path.stat().st_mtime,
+              reverse=True,
+          )
+
+          valid_renders = []
+
+          for path in candidates:
+              probe = subprocess.run(
+                  [
+                      "ffprobe",
+                      "-v",
+                      "error",
+                      "-show_entries",
+                      "format=duration",
+                      "-show_entries",
+                      "stream=codec_type",
+                      "-of",
+                      "json",
+                      str(path),
+                  ],
+                  capture_output=True,
+                  text=True,
+                  check=False,
+                  timeout=30,
+              )
+
+              if probe.returncode != 0:
+                  print(f"Invalid render: {path}")
+                  print(probe.stderr)
+                  continue
+
+              try:
+                  metadata = json.loads(probe.stdout)
+                  duration = float(
+                      metadata.get("format", {}).get("duration", 0)
+                  )
+                  streams = metadata.get("streams", [])
+              except (ValueError, TypeError, json.JSONDecodeError):
+                  continue
+
+              has_video = any(
+                  stream.get("codec_type") == "video"
+                  for stream in streams
+              )
+
+              if has_video and duration > 0:
+                  valid_renders.append(
+                      {
+                          "path": str(path),
+                          "duration_seconds": duration,
+                          "size_bytes": path.stat().st_size,
+                      }
+                  )
+
+          if not valid_renders:
+              print(
+                  "::error::No playable video render passed ffprobe "
+                  "validation."
+              )
+              sys.exit(1)
+
+          artifact_dir = output_root / "ci-artifacts"
+          artifact_dir.mkdir(parents=True, exist_ok=True)
+
+          report_path = artifact_dir / "render-validation.json"
+          report_path.write_text(
+              json.dumps(
+                  {
+                      "result": "passed",
+                      "test_mode": True,
+                      "cpu_only": True,
+                      "validated_renders": valid_renders,
+                  },
+                  ensure_ascii=False,
+                  indent=2,
+              ),
+              encoding="utf-8",
+          )
+
+          for render in valid_renders:
+              print(
+                  "Validated render:",
+                  render["path"],
+                  "| duration:",
+                  render["duration_seconds"],
+                  "seconds | size:",
+                  render["size_bytes"],
+                  "bytes",
+              )
+
+          print(f"Validation report: {report_path}")
+          PY
+
+      - name: Upload CI test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cinema-studio-ci-artifacts
+          path: |
+            workspace/05_master_theater/ci-artifacts/
+            workspace/05_master_theater/**/*.mp4
+            workspace/05_master_theater/**/*.mov
+            workspace/05_master_theater/**/*.mkv
+            workspace/05_master_theater/**/*.webm
+          if-no-files-found: warn
+          retention-days: 7
