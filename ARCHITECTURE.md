@@ -145,3 +145,6 @@ The repository must maintain the following layout:
     ├── 03_audio_studio/
     ├── 04_visual_lab/
     └── 05_master_theater/
+## Execution Modes
+- Test Mode: `--test-mode` (CPU-only deterministic dry-run execution without GPU)
+
